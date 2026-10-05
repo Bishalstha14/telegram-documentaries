@@ -42,7 +42,7 @@ from telegram.ext import Application, CallbackContext, CommandHandler, ExtBot, J
 from telegram_documentaries import observability
 from telegram_documentaries.contracts import InboundUpdate, InvalidInboundUpdateError
 
-__all__ = ["GREETING", "build_application", "on_error", "on_start"]
+__all__ = ["GREETING", "GatewayApplication", "build_application", "on_error", "on_start"]
 
 logger = observability.get_logger("bot")
 
@@ -59,7 +59,10 @@ GREETING = (
 # See the module docstring for why these exist.
 _Bot: TypeAlias = ExtBot[None]
 _Context: TypeAlias = CallbackContext[_Bot, dict[str, object], dict[str, object], dict[str, object]]
-_Application: TypeAlias = Application[
+
+#: Public: `__main__` registers a `post_init` hook, and a hook typed against a
+#: bare `Application` would not satisfy strict `mypy`.
+GatewayApplication: TypeAlias = Application[
     _Bot,
     _Context,
     dict[str, object],
@@ -180,7 +183,7 @@ def _correlation_ids(update: object) -> tuple[int | None, int | None]:
     return chat_id, update_id
 
 
-def build_application(token: str) -> _Application:
+def build_application(token: str) -> GatewayApplication:
     """Build the long-polling application with its single `/start` handler.
 
     Args:

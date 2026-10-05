@@ -1,0 +1,99 @@
+# TECH
+
+The technical contract. Every agent defers to this file.
+
+## Stack
+
+- **Language:** Python 3.11+
+- **Transport:** Telegram Bot API via **long polling** (`python-telegram-bot` 22.x).
+  No webhooks, no public URL, no inbound ports.
+- **Agent framework:** Google ADK (`google-adk` 2.x) — hub-and-spoke.
+- **Models:**
+  - Bouncer — Gemini 3.1 Flash Lite (vision)
+  - Interviewer — Gemini 3.1 Flash Lite
+  - Converter — Gemini 3.1 Flash Image (multimodal in/out)
+  - Scripter — Gemini 3.1 Flash Lite
+  - Narrator — `gemini-3.1-flash-tts-preview`
+- **Validation:** Pydantic v2
+- **Config:** `pydantic-settings`, reading `.env`
+- **Tooling:** pytest, ruff, mypy (strict)
+- **Environment:** project-local `.venv`
+
+## Architecture
+
+ADK hub-and-spoke. The **Interviewer** is the hub: it orchestrates and decides
+what runs next.
+
+- Each pipeline stage is a **discrete agent/module** with a single job.
+- The conversation is an **explicit state machine**. Legal transitions are
+  declared, not implied. A payload arriving at an illegal state is rejected
+  explicitly — never coerced into the current state.
+- Stage boundaries pass **typed models**, never raw dicts.
+
+## Contracts at boundaries
+
+At every edge — parsing Telegram updates, parsing Gemini responses, parsing TTS
+output — convert to a **typed Pydantic model** before the value crosses a module
+boundary.
+
+- Never pass raw dicts or unvalidated payloads between modules.
+- Treat **all external input as untrusted and arbitrary**: a malformed Telegram
+  update, a truncated model reply, an empty TTS body. Each must be handled
+  explicitly, not by hope.
+- Prefer **schemas over regexes**. Parse structure with a model, not with string
+  matching.
+
+## Logging & error policy
+
+Comprehensive **structured logging** throughout. Use `structlog` or
+`logging` with key-value context (`chat_id`, `stage`, `update_id`).
+
+- Prefer **decorators** over scattering `log.info(...)` through business logic.
+- **Fail loudly and log** for non-critical, user-invisible work (image
+  optimisation, temp-file cleanup, analytics).
+- On a **validated user's conversation path**, catch errors and **degrade
+  gracefully** so the conversation continues: log loudly, reply helpfully, never
+  raise into the user's flow.
+- Forbidden: bare `except: pass`, swallowed exceptions, un-logged fallbacks.
+- Never log secrets or raw token values.
+
+## Session state
+
+- **Versioned, per-`chat_id` schema.** Include a `version` field so the shape can
+  evolve without corrupting live sessions.
+- **One shared state driver** owns all reads and writes. No module reaches into
+  another's state.
+- **Reset semantics:** `/start` and `/restart` purge that `chat_id`'s state and
+  its temporary media, without restarting the process. `/restart` must also work
+  mid-conversation.
+- Temporary media lives in a per-session directory that the reset deletes.
+
+## Testing
+
+**Red/Green TDD. Tests are written before code.** No production code lands
+without a failing test that justifies it.
+
+- `scripts/test` — the ground truth. Runs pytest, ruff, and mypy.
+- `scripts/hooks` — the same checks scoped to staged files, run before commit.
+- Test **behaviour, not implementation**. Assert on observable outcomes.
+- Cover the happy path *and* edge cases: empty input, malformed payloads,
+  upstream API failure, out-of-order stage arrival, session isolation.
+- Never make tests require network access or real API keys. Mock at the
+  boundary.
+
+## Repo hygiene
+
+- `.env` is in `.gitignore` and stays there. `.env.example` is committed.
+- Dependencies are pinned in `pyproject.toml`; the environment is reproducible
+  from it.
+- Generated media (`.ogg`, `.mp3`), session directories, and caches are
+  gitignored.
+
+## README policy
+
+The README documents developer-facing behaviour and is kept in sync with the
+code. It must state: what the bot does, how to set up `.env`, how to run it,
+how to run the checks, and the current roadmap phase.
+
+When a feature changes behaviour, the README and the affected constitution or
+roadmap file are updated in the same change — not deferred.

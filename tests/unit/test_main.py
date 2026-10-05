@@ -36,7 +36,7 @@ import pytest
 from conftest import FakeTelegramBot
 from pydantic import ValidationError
 
-from telegram_documentaries import config, observability
+from telegram_documentaries import config, contracts, observability
 
 # Distinctive markers. If any of these reaches stdout, stderr, a log record or a
 # traceback, a secret has leaked. Not plausible real credentials.
@@ -511,7 +511,7 @@ def test_main_chains_the_original_validation_error_for_a_developer(
 
     cause = excinfo.value.__cause__
     assert isinstance(cause, ValidationError)
-    assert config.settings_error_fields(cause) == ("telegram_bot_token", "gemini_api_key")
+    assert contracts.validation_error_fields(cause) == ("telegram_bot_token", "gemini_api_key")
     # The wrapper's own text is safe even though its cause is not.
     for marker in _secret_markers():
         assert marker not in str(excinfo.value)

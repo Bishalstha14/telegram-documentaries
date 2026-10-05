@@ -22,18 +22,57 @@ Two failure modes, deliberately distinct:
 * **A malformed message** (no chat, or ``chat.id`` not an integer) - an
   ``InvalidInboundUpdateError`` is raised. The caller decides how to tell the
   user; it must never invent a default chat id to keep going.
+
+Why ``validation_error_fields`` lives here
+------------------------------------------
+Any pydantic ``ValidationError`` renders the offending ``input_value``, so
+printing ``str(exc)`` leaks whatever was in the input - including a sibling
+secret. That is true of a missing ``.env`` key and equally true of an
+off-schema Gemini reply, which is why this module owns the one safe reader and
+both callers reuse it (D7).
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
 from telegram import Update
 
 from telegram_documentaries import observability
 
-__all__ = ["InboundUpdate", "InvalidInboundUpdateError"]
+__all__ = ["InboundUpdate", "InvalidInboundUpdateError", "validation_error_fields"]
 
 logger = observability.get_logger("contracts")
+
+
+def validation_error_fields(exc: ValidationError) -> tuple[str, ...]:
+    """Return only the offending field *names*, de-duplicated, in order.
+
+    Never return ``str(exc)`` to a caller, a log or stdout. For a missing key
+    pydantic renders the whole input mapping, which includes the sibling
+    secret's value::
+
+        1 validation error for Settings
+        gemini_api_key
+          Field required [type=missing,
+          input_value={'telegram_bot_token': 'SUPERSECRET'}, input_type=dict]
+
+    ``ValidationError.errors()`` is the only safe source: it carries the same
+    field locations, and this function reads nothing else from it.
+
+    Args:
+        exc: The validation failure to summarise. Only field *locations* are read.
+
+    Returns:
+        The offending field names, in report order and without duplicates. An
+        error with no location contributes nothing - a payload fragment must never
+        stand in for a field name.
+    """
+    names: list[str] = []
+    for error in exc.errors():
+        location = error.get("loc", ())
+        if location:
+            names.append(str(location[0]))
+    return tuple(dict.fromkeys(names))
 
 
 class InvalidInboundUpdateError(ValueError):

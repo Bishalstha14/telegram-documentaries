@@ -35,11 +35,8 @@ from __future__ import annotations
 from pydantic import ValidationError
 
 from telegram_documentaries import bot, observability
-from telegram_documentaries.config import (
-    Settings,
-    settings_error_fields,
-    settings_error_message,
-)
+from telegram_documentaries.config import Settings, settings_error_message
+from telegram_documentaries.contracts import validation_error_fields
 
 __all__ = ["ConfigurationError", "load_settings", "main"]
 
@@ -73,7 +70,7 @@ def load_settings() -> Settings:
         # Field names only. `str(exc)` is never touched - see the module
         # docstring for exactly what it would leak.
         raise ConfigurationError(
-            settings_error_message(exc), settings_error_fields(exc)
+            settings_error_message(exc), validation_error_fields(exc)
         ) from exc
 
 

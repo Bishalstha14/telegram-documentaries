@@ -8,8 +8,9 @@ Two rules govern this module, both non-negotiable:
 2. **A secret is never rendered.** Both fields are `SecretStr`, so an accidental
    `repr`, f-string or `model_dump` masks the value. On top of that, the
    `ValidationError` raised for a *missing* key embeds the *sibling* secret in
-   its own text (see `settings_error_fields`), so the error message is built
-   from field names only.
+   its own text, so the error message is built from field names only - read via
+   `contracts.validation_error_fields`, which this module shares with the Gemini
+   boundary rather than reimplementing.
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ from __future__ import annotations
 from pydantic import SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["Settings", "settings_error_fields", "settings_error_message"]
+from telegram_documentaries.contracts import validation_error_fields
+
+__all__ = ["Settings", "settings_error_message"]
 
 
 class Settings(BaseSettings):
@@ -49,32 +52,9 @@ class Settings(BaseSettings):
         return value
 
 
-def settings_error_fields(exc: ValidationError) -> tuple[str, ...]:
-    """Return only the offending field *names*, de-duplicated, in order.
-
-    Never return ``str(exc)`` to a caller, a log or stdout. For a missing key
-    pydantic renders the whole input mapping, which includes the sibling
-    secret's value:
-
-        1 validation error for Settings
-        gemini_api_key
-          Field required [type=missing,
-          input_value={'telegram_bot_token': 'SUPERSECRET'}, input_type=dict]
-
-    ``ValidationError.errors()`` is the only safe source: it carries the same
-    field locations, and this function reads nothing else from it.
-    """
-    names: list[str] = []
-    for error in exc.errors():
-        location = error.get("loc", ())
-        if location:
-            names.append(str(location[0]))
-    return tuple(dict.fromkeys(names))
-
-
 def settings_error_message(exc: ValidationError) -> str:
     """Build the user-facing fatal message. Field names only, no values."""
-    fields = settings_error_fields(exc)
+    fields = validation_error_fields(exc)
     named = ", ".join(fields) if fields else "<not reported by the validator>"
     return (
         f"Invalid configuration: missing or blank required setting(s): {named}. "

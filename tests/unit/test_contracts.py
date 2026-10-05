@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from telegram import Update
 
 from telegram_documentaries import contracts
@@ -312,4 +312,112 @@ def test_contracts_module_exports_only_the_public_surface() -> None:
     assert set(contracts.__all__) == {
         "InboundUpdate",
         "InvalidInboundUpdateError",
+        "validation_error_fields",
     }
+
+
+def test_contracts_no_longer_exposes_settings_error_fields() -> None:
+    """D7 / R2.4: the `.env`-specific name is gone, with no legacy shim.
+
+    A shim would keep the old vocabulary alive in `config`, invite its reuse for
+    Gemini replies, and make the next move harder to see. Asserting its absence
+    is what stops it creeping back.
+    """
+    assert not hasattr(contracts, "settings_error_fields")
+    assert "settings_error_fields" not in contracts.__all__
+
+
+def test_contracts_exposes_validation_error_fields() -> None:
+    assert callable(contracts.validation_error_fields)
+    assert contracts.validation_error_fields.__module__ == "telegram_documentaries.contracts"
+
+
+# --------------------------------------------------------------------------
+# R2.4 / D7 - the leak guard, generalised from `.env` keys to any model.
+#
+# This helper is the project's single mechanism for reading a pydantic error
+# safely. Gemini's off-schema reply fails validation exactly the way a missing
+# `.env` key does - the offending `input_value` carries a sibling secret - so it
+# is the same guard, re-used, rather than a copy.
+# --------------------------------------------------------------------------
+
+
+class _Probe(BaseModel):
+    """Three required fields, shaped like a Gemini stage reply."""
+
+    verdict: str
+    subject: str
+    line: str
+
+
+#: A distinctive marker standing in for a secret that must never be extracted.
+SIBLING_SECRET = "AIzaSUPERSECRET-SIBLING-SECRET-VALUE"
+
+
+def test_validation_error_fields_returns_names_only() -> None:
+    """The mechanism-level guard: field *names*, never values.
+
+    The premise is asserted first - that the raw error really does carry the
+    sibling value inside its own ``input_value`` - so this test cannot quietly
+    become vacuous if pydantic ever stops leaking.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        # `line` is missing, so pydantic reports the whole input mapping - which
+        # still holds the sibling secret in `subject`.
+        _Probe.model_validate({"verdict": "HUMAN", "subject": SIBLING_SECRET})
+    exc = excinfo.value
+
+    # Premise: the error object carries the sibling value inside `input_value`.
+    assert SIBLING_SECRET in str(exc.errors()), (
+        "the validation error no longer carries the sibling value; R2.4's handling "
+        "must be re-evaluated rather than quietly deleted"
+    )
+
+    fields = contracts.validation_error_fields(exc)
+
+    assert fields == ("line",)
+    for field in fields:
+        assert not field.strip().startswith("{")
+    assert SIBLING_SECRET not in ", ".join(fields)
+
+
+def test_validation_error_fields_keeps_order_and_deduplicates() -> None:
+    """Field names arrive in report order, once each - the message reads cleanly."""
+    exc = ValidationError.from_exception_data(
+        "_Probe",
+        [
+            {"type": "missing", "loc": ("verdict",), "input": None},
+            {"type": "missing", "loc": ("subject",), "input": None},
+            {"type": "missing", "loc": ("subject",), "input": None},
+        ],
+    )
+
+    assert contracts.validation_error_fields(exc) == ("verdict", "subject")
+
+
+def test_validation_error_fields_ignores_errors_with_no_field_location() -> None:
+    """A whole-model error carries no `loc`; a payload fragment must not stand in."""
+    exc = ValidationError.from_exception_data(
+        "_Probe",
+        [
+            {
+                "type": "greater_than",
+                "loc": (),
+                "input": {"secret": SIBLING_SECRET},
+                "ctx": {"gt": 0},
+            }
+        ],
+    )
+
+    assert contracts.validation_error_fields(exc) == ()
+    assert SIBLING_SECRET not in ", ".join(contracts.validation_error_fields(exc))
+
+
+def test_validation_error_fields_reports_the_outer_field_of_a_nested_error() -> None:
+    """A nested failure is reported by the field the caller actually owns."""
+    exc = ValidationError.from_exception_data(
+        "_Probe",
+        [{"type": "missing", "loc": ("verdict", 0, "text"), "input": None}],
+    )
+
+    assert contracts.validation_error_fields(exc) == ("verdict",)

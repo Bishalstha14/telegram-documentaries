@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Pre-commit gate: checks staged Python files with ruff and pytest,
+# and always type-checks all of src/ with mypy (per D4).
+
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -x "${repo_root}/.venv/bin/python" ]]; then
+  python_bin="${repo_root}/.venv/bin/python"
+else
+  python_bin="$(command -v python3)"
+fi
+
+cd "${repo_root}"
+
+# Get staged Python files
+staged_py=$(git diff --cached --name-only --diff-filter=ACM -- '*.py' || true)
+
+if [[ -z "${staged_py}" ]]; then
+  echo "No staged Python files to check."
+  exit 0
+fi
+
+# Convert newline-separated to array for safe passing
+# ruff check and pytest both accept file paths
+
+echo "==> ruff check (staged)"
+# shellcheck disable=SC2086
+"${python_bin}" -m ruff check ${staged_py}
+
+echo "==> pytest (staged)"
+# shellcheck disable=SC2086
+"${python_bin}" -m pytest ${staged_py}
+
+echo "==> mypy (all src/)"
+"${python_bin}" -m mypy src/
+
+echo "==> hooks passed"

@@ -81,12 +81,79 @@ receives `/start`, and replies" is an end-to-end transport claim.
 
 ## F. Spec-versus-reality reconciliation
 
-- [ ] Every requirement above is implemented, or the deviation is recorded here
+- [x] Every requirement above is implemented, or the deviation is recorded here
       with its justification.
-- [ ] `ROADMAP.md` Phase 1 marked complete with delivery details; the Status
+- [x] `ROADMAP.md` Phase 1 marked complete with delivery details; the Status
       table updated.
-- [ ] `TECH.md` updated if the implementation changed any stated technical
+- [x] `TECH.md` updated if the implementation changed any stated technical
       requirement or policy.
-- [ ] `MISSION.md` updated only if product scope or behaviour changed.
-- [ ] `README.md` synchronised with shipped behaviour.
-- [ ] Deviations recorded in this spec's files.
+- [x] `MISSION.md` updated only if product scope or behaviour changed.
+- [x] `README.md` synchronised with shipped behaviour.
+- [x] Deviations recorded in this spec's files.
+
+## G. Verification outcome — 2026-10-05
+
+**Verdict: Phase 1 complete.** Sections A–D and F pass; section E was completed
+against the live bot.
+
+| Section | Result |
+|---------|--------|
+| A — Roadmap acceptance criteria | **Pass.** All six criteria met. |
+| B — Requirement coverage R1–R7 | **Pass.** All implemented. |
+| C — Constitution invariants | **Pass.** No `except: pass`, no bare `except`, no raw payload past the boundary, nothing anticipating Phases 2–7. |
+| D — Evidence | **Collected** below. |
+| E — Manual smoke test | **Completed** against `@BishalTech_bot`. |
+| F — Doc reconciliation | **Done.** `ROADMAP.md`, `README.md` and this file updated. |
+
+**Evidence.** `scripts/test` → 107 passed, ruff clean, mypy strict clean, exit 0.
+`scripts/hooks` → exit 0 both with and without staged files, mode 755.
+The A3 failure run, with a sentinel secret substituted for the real one, exits 1
+and reads:
+
+```
+Invalid configuration: missing or blank required setting(s): gemini_api_key.
+Fill them in your .env file - see .env.example for the exact names.
+| event=settings_invalid fields=gemini_api_key
+```
+
+The sentinel value appears nowhere in stdout or stderr — the R2.3 guard holds.
+`grep` finds zero `except: pass` and zero bare `except` in `src/`.
+
+**Section E, as run.** `python -m telegram_documentaries` against the real token
+logged `settings_loaded` and `gateway_started`, then received `/start`
+(`update_id=75407220`, `chat_id=8767055318`) and replied in 283.61 ms, logging
+`start_command_received` and `start_reply_sent`. No token in any log. A plain
+text message is ignored and does not crash, as Phase 1 requires — out-of-order
+input handling is Phase 2.
+
+### Deviations
+
+1. **`InvalidInboundUpdate` → `InvalidInboundUpdateError`.** Renamed to satisfy
+   ruff `N818`. `requirements.md` R3/R4.2 and the module layout were updated to
+   the new name; `N818` remains enabled as the standing regression guard.
+2. **A bug the spec did not anticipate.** `from_telegram` rejected a missing
+   `chat` and a non-integer `chat.id`, but a chat object with **no `id`
+   attribute at all** raised `AttributeError` from a bare `chat.id` access —
+   which `on_start` does not catch, so it escaped the typed contract into the
+   generic error handler. Fixed by reading `getattr(chat, "id", None)`, so an
+   absent id falls into the existing `isinstance` check and is rejected as
+   `InvalidInboundUpdateError` with no new branch. Covered by
+   `test_from_telegram_raises_when_the_chat_has_no_id`, which drives a stub
+   because python-telegram-bot's `Chat.__init__` requires `id` and would reject
+   the payload before this contract saw it.
+3. **Two ERROR records on a failed send.** The `@logged` decorator wraps the send,
+   so a failure emits `start_reply_sent` from its re-raise path and then
+   `handler_failed`. Both are logged and neither leaks a secret, so this satisfies
+   the error policy; it is noisy but not incorrect. Accepted for now.
+4. **`GatewayApplication` is public** in `bot.py`. Needed so `__main__`'s
+   `post_init` hook type-checks under strict mypy. Keeping it private would force
+   `Any` into `__main__`.
+5. **`build_application` does not validate its token.** python-telegram-bot 22.8
+   does not validate at build time; a blank token is impossible at the real entry
+   point because `config.Settings` rejects it. Accepted as fail-fast at the
+   boundary rather than defence in depth.
+6. **`tests/unit/` only.** No `integration`/`component` tiers this phase, since
+   TECH.md forbids tests needing network or real credentials. Can be introduced
+   later if a genuinely useful real-dependency test appears.
+7. **`mypy` is not run over `tests/`.** The fake Telegram context is an
+   intentionally loose double that would need casts under strict mode.

@@ -81,7 +81,9 @@ class InboundUpdate(BaseModel):
 
         Raises:
             InvalidInboundUpdateError: The message exists but cannot be trusted - no
-                chat, or a ``chat.id`` that is not an integer.
+                chat, or a ``chat.id`` that is absent or is not an integer. A
+                missing id is rejected through this same error rather than
+                surfacing as an ``AttributeError``.
         """
         message = update.message
         if message is None:
@@ -104,7 +106,13 @@ class InboundUpdate(BaseModel):
         # Widened to `object` deliberately: python-telegram-bot annotates
         # `Chat.id` as `int` but does not enforce it, so the type checker must not
         # be allowed to conclude that the checks below are dead code.
-        raw_chat_id: object = chat.id
+        #
+        # `getattr` with a `None` default, not a plain attribute access: a chat
+        # object missing `id` outright would otherwise raise `AttributeError`,
+        # which escapes this module's contract and lands in the generic error
+        # handler. `None` falls through to the check below, so an absent id is
+        # rejected through the same typed error as a wrongly-typed one.
+        raw_chat_id: object = getattr(chat, "id", None)
         if isinstance(raw_chat_id, bool) or not isinstance(raw_chat_id, int):
             raise InvalidInboundUpdateError(
                 f"chat.id must be an int, got {type(raw_chat_id).__name__}",

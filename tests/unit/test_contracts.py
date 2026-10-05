@@ -13,6 +13,7 @@ these tests exercise python-telegram-bot's real parsing path.
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -149,6 +150,31 @@ def test_from_telegram_raises_when_the_message_has_no_chat(make_update: Any) -> 
         InboundUpdate.from_telegram(update)
 
     assert "9006" in str(excinfo.value)
+
+
+def test_from_telegram_raises_when_the_chat_has_no_id() -> None:
+    """A chat object missing `id` must not surface as `AttributeError`.
+
+    R3 requires an *absent* `chat.id` to be rejected through the typed error,
+    same as a wrongly-typed one. A plain `chat.id` access would raise
+    `AttributeError`, which `bot.on_start` does not catch, so the payload would
+    escape this contract into the generic error handler.
+
+    Driven through a stub rather than `Update.de_json`, because
+    python-telegram-bot's `Chat.__init__` requires `id` and would reject the
+    payload before this contract ever saw it. That makes the case unreachable via
+    the library's own parser - which is exactly why it needs a direct test:
+    it guards the invariant rather than a path the library happens to prevent.
+    """
+    chat_without_id = SimpleNamespace(type="private")
+    message = SimpleNamespace(chat=chat_without_id, text="/start")
+    update = SimpleNamespace(update_id=9007, message=message)
+
+    with pytest.raises(InvalidInboundUpdateError) as excinfo:
+        InboundUpdate.from_telegram(update)  # type: ignore[arg-type]
+
+    assert "9007" in str(excinfo.value)
+    assert "chat.id" in str(excinfo.value)
 
 
 def test_from_telegram_raises_when_chat_id_is_not_an_integer(make_update: Any) -> None:

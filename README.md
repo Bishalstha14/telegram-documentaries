@@ -23,6 +23,10 @@ Five stages, orchestrated by the Interviewer:
 Transport is Telegram **long polling**. No webhooks, no public URL, no open
 ports — the bot dials out to Telegram.
 
+> **Current state:** only stage 0 exists. `/start` works. The Gemini boundary that
+> every stage will share is built and tested, but no stage has been wired to it
+> yet, so sending a photo today does nothing. Scroll to [Status](#status).
+
 ## Setup
 
 ### 1. Prerequisites
@@ -62,15 +66,74 @@ python -m telegram_documentaries
 
 ### 5. Use
 
-Send `/start`. That is the entire feature today. The bot replies with a short
-greeting stating that it is alive and talking to Telegram, and that the
-portrait-photo pipeline is not built yet.
+Send `/start`. The bot replies with a short greeting confirming it is alive and
+talking to Telegram.
 
-Only `/start` is handled. A photo, or any other message, is ignored — the bot
-registers no other command and no catch-all.
+That is the whole user-facing feature today. Only `/start` is handled — a photo
+or any other message is ignored, because no command or catch-all is registered
+for them yet. The interview, the hybrid animal portrait, the narration, the
+voice note and `/restart` all arrive in later phases. See `SPECS/ROADMAP.md`.
 
-The interview, the hybrid animal portrait, the narration, the voice note and
-`/restart` all arrive in later phases. See `SPECS/ROADMAP.md`.
+## How it is built
+
+The interesting part is not the five stages above. It is the shape of the code
+behind them.
+
+### One module is allowed to talk to Gemini
+
+```
+bot.py  ──▶  bouncer.py  ─┐
+          interviewer.py ─┼──▶  gemini.py  ──▶  google.genai
+           scripter.py   ─┘
+```
+
+No stage imports the SDK. A stage builds a typed `GeminiRequest` and gets back
+either a validated Pydantic model or one of two errors. Everything in between is
+ordinary, testable Python — which is why the whole suite runs with zero network
+access.
+
+### Two kinds of Gemini failure, kept apart
+
+| Error | Means | What the user experiences |
+|---|---|---|
+| `GeminiUnavailableError` | Timeout, network failure, 5xx, rate limit | Retry later. The session survives. |
+| `GeminiResponseError` | A reply arrived and was unusable | Something is wrong with the model's output. Escalate. |
+
+Collapsing these into one exception would force a choice between losing a
+half-finished interview on a rate limit, and hiding a broken reply behind a
+friendly "try again".
+
+### Rejected, never repaired
+
+A malformed reply is treated as a broken reply, never patched up:
+
+- **Truncated** (`MAX_TOKENS`) is rejected *before* parsing. The text of a
+  truncated reply is a valid JSON prefix, so parsing it would mean inventing
+  content the model never produced.
+- **Off-schema** payloads are rejected, not coerced. The schemas are strict, so
+  a model that invents a field is refused rather than quietly believed.
+
+### No secret ever reaches a log
+
+`google.genai`'s `APIError.__str__` interpolates the raw HTTP response body into
+its own message, so printing any failed traceback would print it verbatim. This
+is the same leak class the project already neutralised for Pydantic's
+`ValidationError` in Phase 1 — a different library, the same defence.
+
+Records carry the exception's *class name* and error code. Messages are assembled
+from the stage, a fixed reason and field *names*. The leaky originals are chained
+with `from None` so the stdlib formatter cannot reach them. Tests sweep for a
+planted key and a planted response body appearing in no log record, rendered the
+way a human would actually see them.
+
+### Configuration fails fast, and quietly
+
+Both secrets load as `SecretStr`. A blank secret is rejected as missing, because
+`Field(min_length=1)` silently does *not* enforce on `SecretStr` — a
+whitespace-only token would otherwise load fine and die later as `InvalidToken`
+deep inside the Telegram library. A config error names only the offending
+*fields*, never their values, because Pydantic renders the sibling secret inside
+its error text.
 
 ## Development
 
@@ -80,6 +143,28 @@ The interview, the hybrid animal portrait, the narration, the voice note and
 scripts/test    # pytest + ruff + mypy over the whole tree — the ground truth
 scripts/hooks   # pre-commit: ruff + pytest scoped to staged .py files,
                 # mypy always over all of src/
+```
+
+`scripts/test` is the gate that matters. mypy runs strict, over `src/`, with
+`warn_unreachable` on. It earns its place: the type checker is what caught a real
+bug in the Gemini boundary that 49 passing tests had hidden — the SDK's async
+call lives at `client.aio.models.generate_content`, not on the client, so the
+first wiring type-checked and passed everything and would still have crashed on
+the first live photo.
+
+### Layout
+
+```
+src/telegram_documentaries/
+  __main__.py     entry point; friendly fatal path for bad config
+  bot.py          the /start long-polling gateway
+  config.py       Settings from .env, both secrets as SecretStr
+  contracts.py    InboundUpdate, the typed Telegram boundary
+  gemini.py       the only module that imports google.genai
+  observability.py  configure_logging, get_logger, @logged
+
+tests/unit/       181 tests, no network, no real credentials
+SPECS/            the constitution, and one folder per feature
 ```
 
 ### Contributing
@@ -101,12 +186,27 @@ Never implement directly on `main`.
 - `SPECS/MISSION.md` — what the project is and must do
 - `SPECS/TECH.md` — the technical contract: stack, architecture, policies
 - `SPECS/ROADMAP.md` — the ordered build plan
+- `SPECS/2026-10-05-repository-and-gateway/` — Phase 1, shipped
+- `SPECS/2026-10-05-text-vertical-slice/` — the slice in progress
 - `.guides/img/` — wildlife mascot reference art
 
 ## Status
 
-Phase 1 of 7 — repository and gateway. See `SPECS/ROADMAP.md` for the full plan.
+| Phase | What it delivers | State |
+|---|---|---|
+| 1 | Repository and `/start` gateway | **Done** — 107 tests, verified against the live bot |
+| 2–5 | Text slice: Bouncer → Interviewer → Scripter | **In progress** — Gemini boundary landed, 181 tests |
+| 3 (img) | Converter: the hybrid animal portrait | Not started |
+| 6 | Narrator: the voice note | Not started |
+| 7 | Hardening and polish | Not started |
+
+Phases 2 and 3 of the roadmap are being built together as one vertical slice, so
+that a real narration arrives as Telegram *text* before any image or audio work
+begins. That gives something phone-testable much earlier, and keeps the riskiest
+part — a stateful multi-turn conversation — small and provable on its own.
+
+See `SPECS/ROADMAP.md` for the full plan.
 
 ## License
 
-Not yet specified.
+MIT — see [LICENSE](LICENSE).

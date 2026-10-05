@@ -27,7 +27,7 @@ constitution and README with what was really shipped.
 - [ ] **R2.4** — missing/blank key → one fatal line naming the field(s), exit `1`.
 - [ ] **R3** — `InboundUpdate` is frozen, `extra="ignore"`, `chat_id` typed `int`.
       `from_telegram` returns `None` for a message-less update and raises
-      `InvalidInboundUpdate` for a missing chat or non-integer `chat.id`.
+      `InvalidInboundUpdateError` for a missing chat or non-integer `chat.id`.
 - [ ] **R4.1** — the reply goes through `context.bot.send_message` with a typed
       integer `chat_id`, **not** `update.effective_message.reply_text`.
 - [ ] **R4.2** — malformed inbound → warning logged, nothing sent, no raise.

@@ -134,10 +134,13 @@ way a Telegram update enters the codebase.
 
 - Returns `None` when the update carries no message (e.g. an edited message, a
   poll update). Logged at debug level; the caller returns early.
-- Raises `InvalidInboundUpdate` when the message has no chat, or `chat.id` is
+- Raises `InvalidInboundUpdateError` when the message has no chat, or `chat.id` is
   absent or not an integer. Malformed payloads are **rejected explicitly and
   never coerced** into a well-formed update (TECH.md: "A payload arriving at an
   illegal state is rejected explicitly — never coerced").
+
+  The exception carries the `Error` suffix because that is the project-wide
+  convention for exception types (PEP 8 naming; enforced by ruff N818).
 
 `chat_id` is typed as `int` deliberately. A string-vs-int mismatch on `chat_id`
 is the failure mode that silently breaks session lookups once Phase 3 lands;
@@ -160,7 +163,8 @@ not `update.effective_message.reply_text(...)`.** Two reasons, both required:
    access or real API keys").
 
 **R4.2 — Failure behaviour for malformed input.** `on_start` catches
-`InvalidInboundUpdate`, logs a warning carrying `update_id`, and returns without
+`InvalidInboundUpdateError`, logs a warning carrying `update_id`, and returns
+without
 replying. Loud in logs, silent to the user, never a crash and never a raise.
 
 **R4.3 — Failure behaviour for a Telegram send error.** An `error` handler is
@@ -210,7 +214,7 @@ src/telegram_documentaries/
   __main__.py        entry point: main() -> int
   config.py          Settings
   observability.py   configure_logging(), get_logger(), @logged
-  contracts.py       InboundUpdate, from_telegram(), InvalidInboundUpdate
+  contracts.py       InboundUpdate, from_telegram(), InvalidInboundUpdateError
   bot.py             build_application(), on_start(), on_error()
 tests/unit/
   conftest.py        fake Telegram context fixture

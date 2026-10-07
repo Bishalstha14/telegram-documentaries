@@ -119,9 +119,18 @@ class Answer(_Frozen):
 
 
 class Script(_Frozen):
-    """The finished narration and its measured length."""
+    """The finished narration and its measured length.
 
-    text: Annotated[str, Field(min_length=1), AfterValidator(_non_blank)]
+    Lives with the session because that is where it is stored, and re-exported
+    from `scripter` because that is what produces it. One model, not two: a
+    second definition would let the validator drift, and then the count that
+    passed validation and the count the session holds could disagree.
+    """
+
+    #: 4096 is Telegram's message limit (R8.1); longer cannot be delivered.
+    text: Annotated[
+        str, Field(min_length=1, max_length=4096), AfterValidator(_non_blank)
+    ]
     word_count: int = Field(ge=1)
 
 

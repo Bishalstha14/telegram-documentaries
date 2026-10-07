@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Sequence
 from enum import StrEnum
-from typing import Literal, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 import httpx
 from google import genai
@@ -275,7 +275,9 @@ async def _generate_content(
     config = types.GenerateContentConfig(
         system_instruction=request.system_instruction,
         response_mime_type=_JSON_MIME_TYPE,
-        response_schema=response_schema,
+        # The single place a response schema is serialised for the wire; the
+        # helper's docstring explains why the strip is not optional.
+        response_schema=_strip_additional_properties(response_schema.model_json_schema()),
     )
 
     try:
@@ -401,6 +403,63 @@ class GenAiGeminiClient:
 # --------------------------------------------------------------------------
 # Request construction
 # --------------------------------------------------------------------------
+
+
+#: The schema keys the Gemini API's OpenAPI parser does not recognise, in both
+#: spellings: Pydantic emits the camelCase one for ``extra="forbid"``, and the
+#: SDK's own standardiser understands the snakeCase one. Whichever arrives,
+#: the wire must end up with neither.
+_REJECTED_SCHEMA_KEYS = frozenset({"additionalProperties", "additional_properties"})
+
+
+def _strip_additional_properties(schema: dict[str, Any]) -> dict[str, Any]:
+    """Serialised schema without ``additionalProperties`` - a key the API rejects.
+
+    Every reply schema in this project declares ``extra="forbid"`` (R7/R8: an
+    off-schema payload is rejected, never coerced), and Pydantic serialises that
+    as ``additionalProperties: false`` on the top-level object *and* on every
+    nested object - including each entry under ``$defs``, where
+    ``InterviewPlan`` nests ``Question``. The ``google-genai`` SDK (v2.28.0)
+    then dumps its ``Schema`` model by field name, so the key crosses the wire
+    snake-cased as ``additional_properties``, which the API's OpenAPI parser
+    does not recognise. Every call then dies with::
+
+        400 INVALID_ARGUMENT. Invalid JSON payload received. Unknown name
+        "additional_properties" at 'generation_config.response_schema':
+        Cannot find field.
+
+    The key is therefore dropped from what we *ask* the API for - and only
+    from that. What we *accept* is unchanged: the reply is still validated by
+    the original model, whose ``extra="forbid"`` keeps rejecting fields we did
+    not ask for. Deleting ``extra="forbid"`` from the models instead would
+    trade a request we cannot send for a reply we no longer screen, which is
+    why the strip lives here, at the single place the wire schema is built.
+
+    Pure: a fresh structure is returned and `schema` is never modified.
+
+    Args:
+        schema: A serialised JSON schema, as `BaseModel.model_json_schema()`
+            produces it.
+
+    Returns:
+        A new schema of the same shape, with both spellings of the key removed
+        from every object at any depth, in any dict or list.
+    """
+
+    def strip(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {
+                key: strip(value)
+                for key, value in node.items()
+                if key not in _REJECTED_SCHEMA_KEYS
+            }
+        if isinstance(node, list):
+            return [strip(item) for item in node]
+        return node
+
+    # `strip` walks arbitrary JSON, hence `Any`; the value at this level is
+    # always the dict that was handed in.
+    return cast(dict[str, Any], strip(schema))
 
 
 def _contents_of(request: GeminiRequest) -> types.Content:

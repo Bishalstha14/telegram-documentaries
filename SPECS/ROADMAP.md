@@ -20,6 +20,33 @@ transport works end to end before any AI is involved.
 
 **Rubric:** foundation. Serves the happy-path criterion only in skeletal form.
 
+**Delivered (2026-10-05).** Six modules under `src/telegram_documentaries/`:
+`config.py` (`Settings`, both secret guards), `observability.py`
+(`configure_logging` / `get_logger` / `@logged`), `contracts.py`
+(`InboundUpdate` at the Telegram boundary), `bot.py` (the `/start` gateway),
+`__main__.py` (entry point), plus the package. Both dev scripts ship and are
+executable: `scripts/test` (107 tests, ruff, mypy strict) and `scripts/hooks`
+(pre-commit; ruff + pytest staged-scoped, mypy always over all of `src/`).
+
+Verified against the live bot `@BishalTech_bot`: the process starts, long-polls,
+received `/start` (update_id 75407220) and replied in 283.61 ms, logging
+`settings_loaded`, `gateway_started`, `start_command_received` and
+`start_reply_sent`. The token never appears in any log. A missing or blank
+secret exits 1 naming only the offending field, with the sibling secret absent
+from stdout and stderr.
+
+Two behaviours beyond the original letter of the phase, both required by R2 and
+verified in the venv: a non-blank validator on each secret (`Field(min_length=1)`
+does not enforce on `SecretStr`, so a whitespace-only token would otherwise load
+and then fail as `InvalidToken` deep inside the library), and field-names-only
+error reporting (Pydantic's `ValidationError` embeds a sibling secret in
+`input_value`, so it must never be printed verbatim).
+
+Deviation from the spec text: the boundary exception is
+`InvalidInboundUpdateError`, renamed from `InvalidInboundUpdate` to satisfy ruff
+`N818`; the spec's `requirements.md` and `validation.md` were updated to match,
+and `N818` stays enabled as the regression guard.
+
 ---
 
 ## Phase 2 — Bouncer
@@ -115,7 +142,7 @@ Hardening across the whole pipeline.
 
 | Phase | Name | Status |
 |-------|------|--------|
-| 1 | Repository & gateway | Not started |
+| 1 | Repository & gateway | **Complete** (verified live) |
 | 2 | Bouncer | Not started |
 | 3 | Interviewer | Not started |
 | 4 | Converter | Not started |

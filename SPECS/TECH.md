@@ -42,6 +42,27 @@ boundary.
   explicitly, not by hope.
 - Prefer **schemas over regexes**. Parse structure with a model, not with string
   matching.
+- Malformed payloads are **rejected explicitly, never coerced**. A missing
+  attribute must surface through the module's own typed error, not as an
+  `AttributeError` or a pydantic error that callers do not catch. This includes
+  absent attributes, not just wrongly-typed ones.
+- Exception names carry an `Error` suffix (`InvalidInboundUpdateError`), enforced
+  by ruff `N818`.
+
+## Secrets
+
+Two guards, both verified necessary in the venv rather than assumed:
+
+- **A blank secret must be rejected as missing.** `Field(min_length=1)` does not
+  enforce on `SecretStr`, so a whitespace-only token loads successfully and then
+  fails as `InvalidToken` deep inside the Telegram library. An explicit non-blank
+  validator is required.
+- **A validation error must never be printed verbatim.** Pydantic renders the
+  sibling field's value inside `input_value`, so printing `str(exc)` leaks the
+  other secret. Extract field **names** only, via `ValidationError.errors()`.
+
+Module naming: the logging module is `observability.py`, **not** `logging.py` — it
+shadows a stdlib module name inside the package.
 
 ## Logging & error policy
 

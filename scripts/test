@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# The ground truth. Runs pytest, then ruff, then mypy. Any non-zero exit fails.
+#
+# Resolves the repository root so it works from any working directory, and
+# prefers the project-local .venv interpreter over anything on PATH.
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -x "${repo_root}/.venv/bin/python" ]]; then
+  python_bin="${repo_root}/.venv/bin/python"
+else
+  python_bin="$(command -v python3)"
+fi
+
+cd "${repo_root}"
+
+echo "==> pytest"
+"${python_bin}" -m pytest
+
+echo "==> ruff check"
+"${python_bin}" -m ruff check .
+
+echo "==> mypy"
+"${python_bin}" -m mypy

@@ -138,3 +138,71 @@ def app_records() -> Iterator[LogRecorder]:
     finally:
         app_logger.removeHandler(recorder)
         app_logger.setLevel(previous_level)
+
+
+# --------------------------------------------------------------------------
+# Fake Gemini client
+#
+# The mock boundary for every stage: `generate` is the whole seam, so a fake
+# that records its calls and returns a canned reply means no test ever opens a
+# socket or spends a real API call. Stages receive this instead of
+# `GenAiGeminiClient`.
+# --------------------------------------------------------------------------
+
+
+class FakeGeminiClient:
+    """Records every `generate` call and returns whatever the test queued up.
+
+    Args:
+        replies: Replies to hand back, in order. A `BaseModel` is returned as
+            is; anything else is returned as given, so a test can queue an error
+            to raise or an off-schema value to reject.
+        error: If set, every call raises this. Used for transport-failure paths.
+    """
+
+    def __init__(
+        self,
+        replies: list[Any] | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.replies = list(replies or [])
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    async def generate(
+        self,
+        request: Any,
+        response_schema: type[Any],
+        chat_id: int,
+        update_id: int,
+    ) -> Any:
+        self.calls.append(
+            {
+                "request": request,
+                "response_schema": response_schema,
+                "chat_id": chat_id,
+                "update_id": update_id,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        if not self.replies:
+            raise AssertionError(
+                f"FakeGeminiClient ran out of replies after {len(self.calls)} call(s)"
+            )
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+@pytest.fixture
+def fake_gemini() -> FakeGeminiClient:
+    """An empty fake; queue replies per test."""
+    return FakeGeminiClient()
+

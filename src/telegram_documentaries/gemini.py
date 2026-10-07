@@ -301,6 +301,31 @@ async def _generate_content(
             chat_id=chat_id,
             update_id=update_id,
         ) from None
+    except Exception as exc:
+        # Final catch-all, and it has to be one: `google.genai` reads the 200
+        # body *inside* `generate_content` - `json.loads`, then its own
+        # converters, then pydantic - so a body its parser cannot turn into a
+        # `GenerateContentResponse` raises before `_typed_reply` ever sees an
+        # object. Those failures are none of the four types above: with
+        # google-genai 2.28.0 the escaping set is `ValidationError`,
+        # `JSONDecodeError`, `TypeError` and `AttributeError`, and the first
+        # carries the raw body in `str(exc)` as `input_value=...`.
+        #
+        # `_reject`, not `_unavailable`: a 200 that the gateway or the SDK
+        # cannot read is a reply we were handed and could not use - a defect at
+        # the reply end, like `UnknownApiResponseError` - rather than a network,
+        # quota or 5xx outage, so it must be the loud class and must not
+        # advertise the session as worth retrying (R1.6).
+        #
+        # Class name only, never `str(exc)`/`repr(exc)`, and `from None` so the
+        # `@logged` decorator's `exc_info` traceback cannot reach the original
+        # either (R1.7, and this function's own invariant above).
+        raise _reject(
+            stage,
+            f"the SDK could not read the reply ({type(exc).__name__})",
+            chat_id=chat_id,
+            update_id=update_id,
+        ) from None
 
     return _typed_reply(stage, raw, response_schema, chat_id, update_id)
 
@@ -394,7 +419,8 @@ class GenAiGeminiClient:
             GeminiUnavailableError: The call did not produce a usable answer for
                 environmental reasons - a timeout, a transport failure, a 5xx or
                 a 429.
-            GeminiResponseError: A reply arrived and was rejected under R1.4.
+            GeminiResponseError: A reply arrived and was rejected under R1.4 -
+                or it arrived as a 200 body the SDK itself could not read.
         """
         call = _STAGE_CALLS[request.stage]
         return await call(self._transport, request, response_schema, chat_id, update_id)

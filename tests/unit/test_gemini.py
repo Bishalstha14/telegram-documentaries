@@ -2,7 +2,7 @@
 
 Every reply arrives from outside the process, so this module is where "reject
 explicitly, never coerce" is either true or merely claimed. The tests below pin
-six things, one behaviour each:
+seven things, one behaviour each:
 
 * **Schema-first replies (R1.3).** Every call asks for
   ``application/json`` and hands over the caller's Pydantic model, so structure
@@ -21,12 +21,19 @@ six things, one behaviour each:
   HTTP response body in ``self.details``. Every failure path is therefore swept
   with sentinels: the API key and the response body must appear in no log record
   and in no exception message.
+* **The SDK's own response parsing (R1.7 / B1).** The SDK reads the 200 body
+  *inside* ``generate_content``, above ``_typed_reply``; a body it cannot parse
+  raises ``ValidationError``/``JSONDecodeError``/``TypeError``/
+  ``AttributeError`` there. Those must become a typed ``GeminiError`` with the
+  body in no record - swept through a double plugged one layer lower than the
+  transport, at the SDK's ``httpx_async_client``, so the real parser runs.
 * **A bounded call (R1.5, R1.8).** The timeout is applied to the constructed
   client, and the model id is the one constant every stage shares.
 
-Nothing here touches the network or a real credential. The mock boundary is
-``generate_content`` itself - the HTTP call - and ``GenAiGeminiClient`` accepts
-an injected transport for exactly that reason, so a test never reaches a socket.
+Nothing here touches the network or a real credential. The mock boundary is the
+HTTP call itself: ``GenAiGeminiClient`` accepts an injected transport, and the
+B1 section injects one layer lower still - a scripted ``httpx_async_client``
+inside a real ``genai.Client`` - so a test never reaches a socket.
 """
 
 from __future__ import annotations
@@ -1007,6 +1014,199 @@ async def test_a_failed_call_is_still_decorated_with_stage_and_model(
     assert calls
     assert calls[0]["stage"] == "scripter"
     assert calls[0]["model"] == gemini.MODEL_ID
+
+
+# ==========================================================================
+# R1.7 / B1 - a malformed 200 body the SDK's *own* parser cannot read.
+# ==========================================================================
+#
+# Every sweep above is driven through `FakeTransport`, which sits *above* the
+# SDK's response parsing: `generate_content` returns a hand-built
+# `GenerateContentResponse`, so `google.genai` never has to read a wire body
+# at all. Production does. The SDK parses the 200 body *inside*
+# `models.generate_content` - `json.loads`, then its own converters, then
+# pydantic - and any of those failures, raised before `_typed_reply` sees an
+# object, is none of the four classified types on the transport `try`, so it
+# used to escape `Gemini.generate` entirely. Empirically, with google-genai
+# 2.28.0, the escaping set is `ValidationError`, `JSONDecodeError`, `TypeError`
+# and `AttributeError`.
+#
+# Two harms, both blocking:
+#
+# * `ValidationError.__str__` renders `input_value=...` - the raw body - and
+#   `observability.logged`'s `async_wrapper` logs the escape with
+#   `exc_info=True`, so the body lands in a real record (R1.7, and the
+#   function's own stated invariant).
+# * `pipeline._respond` catches only `GeminiError`/`SessionError`/
+#   `MediaError`, so the escape reaches `bot.on_error`: the turn ends with
+#   `handler_failed` and nothing sent to the user.
+#
+# The doubles below therefore plug into the *real* `genai.Client` one layer
+# lower than `FakeTransport` - at `HttpOptions.httpx_async_client`, the SDK's
+# own supported HTTP seam - so the whole request/response path runs for real
+# and only the bytes on the wire are scripted.
+
+
+class _ScriptedAsyncHttpClient(httpx.AsyncClient):
+    """An `httpx.AsyncClient` answering every call with one scripted 200 body.
+
+    Handed to a real `genai.Client` through `HttpOptions.httpx_async_client`,
+    so nothing between here and `GenerateContentResponse` is mocked: request
+    building, status checking, `json.loads` and pydantic validation all run
+    exactly as they do in production. A body the SDK's parser rejects therefore
+    fails where it would in production - *inside* `generate_content`, above
+    `_typed_reply`.
+    """
+
+    def __init__(self, body: str) -> None:
+        super().__init__()
+        self._body = body
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        return httpx.Response(200, text=self._body, request=httpx.Request(method, url))
+
+    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        return httpx.Response(200, text=self._body, request=request)
+
+
+def _sdk_client_replaying(body: str) -> genai.Client:
+    """A real SDK client whose HTTP layer replays `body` as a 200."""
+    return genai.Client(
+        api_key=API_KEY,
+        http_options=types.HttpOptions(httpx_async_client=_ScriptedAsyncHttpClient(body)),
+    )
+
+
+def _sdk_parsing_transport(body: str) -> Any:
+    """The production transport, over a client that replays `body`."""
+    return gemini._GenAiTransport(_sdk_client_replaying(body))
+
+
+async def _run_with_body(body: str) -> BaseException | None:
+    """Drive `generate` over `body`, returning whatever escaped the boundary."""
+    try:
+        await _generate(_client(_sdk_parsing_transport(body)))
+    except Exception as exc:
+        return exc
+    return None
+
+
+#: The documented trigger shapes: every exception class the SDK can raise while
+#: reading a 200 body is represented - `ValidationError`, `JSONDecodeError`,
+#: `TypeError`, `AttributeError`. `usageMetadata` as a string is the shape most
+#: plausible from API/SDK version skew, and the sentinel rides in every body so
+#: a leak through `str(exc)` is detectable.
+_MALFORMED_200_BODIES = [
+    pytest.param(
+        json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL}),
+        id="usage_metadata_is_a_string",
+    ),
+    pytest.param(
+        json.dumps({"candidates": [{"content": {"parts": RESPONSE_BODY_SENTINEL}}]}),
+        id="parts_is_a_string",
+    ),
+    pytest.param(
+        f"{RESPONSE_BODY_SENTINEL} - this is not JSON at all",
+        id="not_json_at_all",
+    ),
+    pytest.param(
+        json.dumps({"candidates": [RESPONSE_BODY_SENTINEL, 7]}),
+        id="candidates_contains_an_int",
+    ),
+    pytest.param(
+        json.dumps(
+            {"candidates": [{"content": {"parts": [{"text": {"a": RESPONSE_BODY_SENTINEL}}]}}]}
+        ),
+        id="text_is_an_object",
+    ),
+]
+
+#: The two documented trigger shapes: both carry the body in `str(exc)`, so
+#: both leak into a rendered traceback when the exception escapes.
+_BODY_BEARING_200_BODIES = [
+    pytest.param(
+        json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL}),
+        id="usage_metadata_is_a_string",
+    ),
+    pytest.param(
+        json.dumps({"candidates": [{"content": {"parts": RESPONSE_BODY_SENTINEL}}]}),
+        id="parts_is_a_string",
+    ),
+]
+
+
+async def test_the_scripted_200_body_reaches_the_sdks_own_response_parser() -> None:
+    """Premise: this double sits *below* the SDK's parsing, unlike `FakeTransport`.
+
+    If the seam ever moves back above parsing, this fails loudly and the tests
+    below are shown to be sweeping the same layer the old sentinel sweeps
+    already covered - i.e. nothing - rather than passing on a ghost.
+    """
+    client = _sdk_client_replaying(json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL}))
+
+    with pytest.raises(ValidationError) as excinfo:
+        await client.aio.models.generate_content(
+            model=gemini.MODEL_ID,
+            contents=types.Content(role="user", parts=[types.Part.from_text(text="hi")]),
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+
+    assert RESPONSE_BODY_SENTINEL in str(excinfo.value), (
+        "the SDK must really be parsing this body, and really be choking on it"
+    )
+
+
+@pytest.mark.parametrize("body", _MALFORMED_200_BODIES)
+async def test_a_malformed_200_body_the_sdk_cannot_read_is_a_typed_gemini_error(
+    body: str,
+) -> None:
+    """(i) Every SDK-side read failure becomes a `GeminiError`, never escapes.
+
+    At least one case per sibling class in the escaping set - `ValidationError`,
+    `JSONDecodeError`, `TypeError`, `AttributeError` - because a catch-all that
+    only handled the reported shape would leave the rest of the category open.
+
+    Classified as `_reject`, not `_unavailable`: a 200 the gateway or SDK
+    cannot read is a bad reply, not an outage (R1.6), so it is the loud class
+    and the record is `gemini_reply_rejected`.
+
+    `__suppress_context__` pins the *prevention mechanism*: the original is
+    chained with `from None`, so no formatter can reach `str(exc)` - which for
+    three of these shapes carries the raw body.
+    """
+    raised = await _run_with_body(body)
+
+    assert isinstance(raised, GeminiResponseError), (
+        "the boundary must map the SDK's own parsing failure onto the taxonomy, "
+        f"but a {type(raised).__name__} escaped"
+    )
+    assert raised.__suppress_context__, (
+        "the original must be chained with `from None`, unreachable to a formatter"
+    )
+
+
+@pytest.mark.parametrize("body", _BODY_BEARING_200_BODIES)
+async def test_a_body_bearing_malformed_200_body_is_typed_and_never_logged(
+    body: str,
+    app_records: LogRecords,
+) -> None:
+    """Both harms at once: a typed error *and* no body in any rendered record.
+
+    Asserted in leak-first order so a regression reports the blocking harm
+    (R1.7 - the body rendered into the decorator's `exc_info`) rather than the
+    taxonomy miss, which the test above already owns on its own.
+    """
+    raised = await _run_with_body(body)
+
+    assert app_records.records, "a failed call must be logged, never silent"
+    rendered = _rendered(app_records.records)
+    assert RESPONSE_BODY_SENTINEL not in rendered, (
+        "the raw 200 body reached a log record:\n" + rendered
+    )
+    assert isinstance(raised, GeminiResponseError), (
+        "a raw SDK parsing error escaping also means the turn ends with no reply, "
+        f"but a {type(raised).__name__} escaped"
+    )
 
 
 # ==========================================================================

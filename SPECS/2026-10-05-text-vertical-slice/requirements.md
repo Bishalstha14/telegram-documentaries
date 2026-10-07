@@ -608,6 +608,43 @@ path, and a sibling test sweeps for the API key.
    papered over.
 5. **No session TTL or pruning,** and no `SCRIPTING` phase (D4).
 
+### Deviations discovered while building
+
+Recorded after the plan was approved, each with the reason it happened.
+
+6. **`plan.md` never schedules R2** (the `contracts.py` attachment union), even
+   though `requirements.md` carries it and the R9 decision table cannot be
+   written without an `attachment` field to switch on. It was implemented ahead
+   of TG9 as its own commit (`feat: type the Telegram attachment as a
+   discriminated union`). `plan.md` is left as approved; this note is the
+   correction.
+7. **The greeting constant moved out of `bot.py`, not only its test.** R9.4
+   says the test "moves with the constant, retargeted at the hub's `/start`
+   text". Implementing D10 — an adapter with no conversational text of its own —
+   made the stronger move correct: `WELCOME`, `PHOTO_REQUEST`, `RESTARTED`,
+   `SCRIPTED_NUDGE`, `GENERIC_FAILURE` and `SCRIPT_FAILED` all live in
+   `pipeline.py`, and `bot.GREETING` is deleted rather than re-exported (a shim
+   would be exactly the half-measure D10 forbids). The credential sweep is
+   retargeted at all six strings, which is a strictly larger assertion than the
+   original one.
+8. **The happy-path log event is `start_received`, not
+   `start_command_received`.** `_dispatch` emits one uniform `<entry>_received`
+   for all three entry points (`start`, `restart`, `message`), so adding a
+   handler cannot mean remembering another bespoke event name. The correlation
+   ids on the record are unchanged, so validation.md's section E assertion still
+   holds as written.
+9. **`tests/unit/conftest.py` gained a real `ConversationPipeline` fixture**
+   wired to fakes, rather than a stub of the hub. The adapter's contract is
+   "call the hub and send what it returns"; a stub would assert only that the
+   adapter calls a stub, and would silently keep passing if the hub's reply
+   stopped being a string.
+10. **`.gitignore` gained explicit SSH key patterns.** A `GITHUB-SSH-KEY.txt`
+    deploy key — the live key `origin` pushes over — was sitting untracked in
+    the repository root, and the existing `*.key` / `*.pem` rules do not match a
+    `.txt` filename. The file itself was left untouched, but a later `git add .`
+    would have committed a private key. This is repo hygiene rather than a
+    spec deviation, recorded here because it happened inside this change.
+
 ## Required documentation changes in this phase
 
 Per TECH.md's README policy, documentation ships in the same change as behaviour.

@@ -23,9 +23,11 @@ Five stages, orchestrated by the Interviewer:
 Transport is Telegram **long polling**. No webhooks, no public URL, no open
 ports — the bot dials out to Telegram.
 
-> **Current state:** only stage 0 exists. `/start` works. The Gemini boundary that
-> every stage will share is built and tested, but no stage has been wired to it
-> yet, so sending a photo today does nothing. Scroll to [Status](#status).
+> **Current state:** stages 1, 2 and 4 — Bouncer, Interviewer and Scripter —
+> are wired end to end, so the text slice works: send a portrait photo, answer
+> 5–7 questions, get the narration as a message. The hybrid image (Converter)
+> and the voice note (Narrator) are **not** built yet. Scroll to
+> [Status](#status).
 
 ## Setup
 
@@ -66,13 +68,21 @@ python -m telegram_documentaries
 
 ### 5. Use
 
-Send `/start`. The bot replies with a short greeting confirming it is alive and
-talking to Telegram.
+```
+/start            greet you and ask for a photo
+<portrait photo>  pass the Bouncer, then answer 5–7 questions
+                  -> receive the narration as a message
+/restart          at any time: wipe the session and start over
+```
 
-That is the whole user-facing feature today. Only `/start` is handled — a photo
-or any other message is ignored, because no command or catch-all is registered
-for them yet. The interview, the hybrid animal portrait, the narration, the
-voice note and `/restart` all arrive in later phases. See `SPECS/ROADMAP.md`.
+Everything else is declined with one short line. A sticker, a video or a voice
+note gets `unsupported_media`; a photo that fails the vision gate gets the
+Bouncer's rejection; a text message arriving before the photo gets a nudge back
+to the conversation. One reply per message, always.
+
+The hybrid animal image and the voice note are not built yet — when the
+interview finishes you get the narration as **text**. See
+`SPECS/ROADMAP.md`.
 
 ## How it is built
 
@@ -82,15 +92,22 @@ behind them.
 ### One module is allowed to talk to Gemini
 
 ```
-bot.py  ──▶  bouncer.py  ─┐
-          interviewer.py ─┼──▶  gemini.py  ──▶  google.genai
-           scripter.py   ─┘
+bot.py ──▶ pipeline.py ──┬──▶ bouncer.py ───────┐
+          (the decision  ├──▶ interviewer.py ──┼──▶ gemini.py ──▶ google.genai
+           table)        └──▶ scripter.py ─────┘
 ```
 
 No stage imports the SDK. A stage builds a typed `GeminiRequest` and gets back
 either a validated Pydantic model or one of two errors. Everything in between is
 ordinary, testable Python — which is why the whole suite runs with zero network
 access.
+
+`bot.py` is only an adapter: it parses the update, calls
+`pipeline.handle_start` / `handle_restart` / `handle_message`, and sends the one
+string that comes back. It has no conversational text of its own, and it never
+constructs a hub — `__main__` builds the collaborators and injects them. The
+consequences live in `state.py`, a plain class with no I/O, so the decision
+table is testable without Telegram, Gemini or a filesystem.
 
 ### Two kinds of Gemini failure, kept apart
 
@@ -156,14 +173,20 @@ the first live photo.
 
 ```
 src/telegram_documentaries/
-  __main__.py     entry point; friendly fatal path for bad config
-  bot.py          the /start long-polling gateway
-  config.py       Settings from .env, both secrets as SecretStr
+  __main__.py     entry point; builds the hub and injects it
+  bot.py          the Telegram adapter: parse -> hub -> one send
+  pipeline.py     the decision table; the only place that decides
+  state.py        SessionStore, phases, transitions — no I/O
   contracts.py    InboundUpdate, the typed Telegram boundary
+  bouncer.py      the vision gate
+  interviewer.py  5–7 questions, one at a time
+  scripter.py     the 60–90 word narration, one corrective retry
+  media.py        MediaStore, the local file tree
   gemini.py       the only module that imports google.genai
+  config.py       Settings from .env, both secrets as SecretStr
   observability.py  configure_logging, get_logger, @logged
 
-tests/unit/       181 tests, no network, no real credentials
+tests/unit/       474 tests, no network, no real credentials
 SPECS/            the constitution, and one folder per feature
 ```
 
@@ -194,8 +217,8 @@ Never implement directly on `main`.
 
 | Phase | What it delivers | State |
 |---|---|---|
-| 1 | Repository and `/start` gateway | **Done** — 107 tests, verified against the live bot |
-| 2–5 | Text slice: Bouncer → Interviewer → Scripter | **In progress** — Gemini boundary landed, 181 tests |
+| 1 | Repository and `/start` gateway | **Done** — verified against the live bot |
+| 2–5 | Text slice: photo → Bouncer → Interviewer → Scripter | **Implemented** — 474 tests green, live smoke test pending |
 | 3 (img) | Converter: the hybrid animal portrait | Not started |
 | 6 | Narrator: the voice note | Not started |
 | 7 | Hardening and polish | Not started |
@@ -204,6 +227,11 @@ Phases 2 and 3 of the roadmap are being built together as one vertical slice, so
 that a real narration arrives as Telegram *text* before any image or audio work
 begins. That gives something phone-testable much earlier, and keeps the riskiest
 part — a stateful multi-turn conversation — small and provable on its own.
+
+**What you can do today:** `/start`, send a portrait photo, answer 5–7
+questions, read the narration, `/restart`. **What you cannot do yet:** see the
+hybrid animal image, or hear the voice note — those are the Converter and the
+Narrator, both still ahead.
 
 See `SPECS/ROADMAP.md` for the full plan.
 

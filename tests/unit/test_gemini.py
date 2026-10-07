@@ -208,6 +208,33 @@ async def test_generate_returns_the_typed_model_when_the_reply_validates() -> No
     assert isinstance(verdict, Verdict)
 
 
+async def test_an_interviewer_reply_json_array_arrives_as_a_typed_plan() -> None:
+    """The one reply shape the Interviewer ever receives, end to end.
+
+    `json.loads` yields a *list* for `questions`, and strict mode rejects a
+    list for a `tuple[...]` field - so before the fix this perfectly
+    well-formed reply was discarded at the schema as though it were off-schema,
+    and the interview died on its first question. The body here is byte-for-
+    byte what a real reply looks like: a JSON array of question objects.
+    """
+    reply_body = json.dumps(
+        {
+            "questions": [{"text": f"Question {n}?"} for n in range(5)],
+            "suggested_animal": "sea otter",
+        }
+    )
+    transport = FakeTransport(_reply(reply_body))
+
+    reply = await _client(transport).generate(
+        _request(stage=Stage.INTERVIEWER), InterviewPlan, -1, 4242
+    )
+
+    assert isinstance(reply, InterviewPlan)
+    assert len(reply.questions) == 5
+    assert reply.questions[0].text == "Question 0?"
+    assert reply.suggested_animal == "sea otter"
+
+
 async def test_generate_requests_json_with_the_stage_schema() -> None:
     """The schema-first guard (R1.3).
 

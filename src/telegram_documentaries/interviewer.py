@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 from telegram_documentaries import observability
 from telegram_documentaries.gemini import GeminiClient, GeminiRequest, Stage
@@ -78,6 +78,29 @@ class InterviewPlan(_Frozen):
     suggested_animal: Annotated[
         str, Field(min_length=1, max_length=MAX_ANIMAL_LENGTH), AfterValidator(_non_blank)
     ]
+
+    @field_validator("questions", mode="before")
+    @classmethod
+    def _accept_json_arrays(cls, value: object) -> object:
+        """Accept what `json.loads` produces: an array is a `list`, never a tuple.
+
+        Strict mode is right to reject a list for a `tuple[...]` field - it is
+        what keeps this plan immutable - but a Gemini reply crosses the boundary
+        as JSON, so the array arrives as a list and would otherwise be discarded
+        as off-schema (R1.4.5), taking every well-formed interview with it.
+        Coercing *before* validation keeps the field declared as
+        `tuple[Question, ...]`, so `plan.questions.append(...)` still raises, the
+        5-7 rule stays a field constraint, and `extra="forbid"` plus the
+        non-blank check still run over each question afterwards.
+
+        `list[Question]` would accept the reply too, and would be the wrong fix:
+        it silences the error by letting a mutable list stand where the frozen
+        model promises a tuple, voiding `_Frozen`'s guarantee while every
+        existing test keeps passing.
+        """
+        if isinstance(value, list):
+            return tuple(value)
+        return value
 
 
 logger = observability.get_logger(__name__)

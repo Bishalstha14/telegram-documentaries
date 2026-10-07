@@ -20,6 +20,8 @@ Nothing here touches the network or a real credential.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from conftest import FakeGeminiClient
 from pydantic import ValidationError
@@ -218,6 +220,101 @@ def test_the_plan_model_is_frozen() -> None:
 
     with pytest.raises(ValidationError):
         plan_model.suggested_animal = "wolf"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------
+# The JSON reply shape - what `json.loads` actually hands the validator
+# --------------------------------------------------------------------------
+
+
+def _json_reply(count: int = 5, *, animal: str = ANIMAL) -> dict[str, Any]:
+    """Exactly what `json.loads` produces from a well-formed Interviewer reply.
+
+    A *list* of dicts, never a tuple: `gemini._typed_reply` feeds this shape
+    straight into `InterviewPlan.model_validate`, so this is the shape that has
+    to validate. Every test above builds the Python-native tuple instead, which
+    is why they all passed while every real reply was being thrown away.
+    """
+    return {
+        "questions": [{"text": f"Question {n}?"} for n in range(count)],
+        "suggested_animal": animal,
+    }
+
+
+@pytest.mark.parametrize("count", [5, 6, 7])
+def test_a_json_shaped_reply_of_five_to_seven_questions_validates(count: int) -> None:
+    """The real reply shape is accepted, not just the Python-native tuple.
+
+    Strict mode rejects a `list` for a `tuple[...]` field, so before the fix
+    this well-formed reply failed validation with `tuple_type` and the whole
+    interview died on its first question.
+    """
+    plan_model = InterviewPlan.model_validate(_json_reply(count))
+
+    assert isinstance(plan_model.questions, tuple)
+    assert [q.text for q in plan_model.questions] == [f"Question {n}?" for n in range(count)]
+    assert plan_model.suggested_animal == ANIMAL
+
+
+@pytest.mark.parametrize(("count", "error_type"), [(4, "too_short"), (8, "too_long")])
+def test_a_json_shaped_reply_outside_five_to_seven_is_rejected_by_the_field(
+    count: int, error_type: str
+) -> None:
+    """The 5-7 rule survives as a *field* constraint, not a hub check.
+
+    The payload is first accepted as a collection and only then refused on
+    length - so the rejection comes from `questions` itself, at loc
+    `("questions",)`, exactly as the class docstring promises.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        InterviewPlan.model_validate(_json_reply(count))
+
+    errors = excinfo.value.errors()
+    assert [error["type"] for error in errors] == [error_type]
+    assert errors[0]["loc"] == ("questions",)
+
+
+def test_an_unexpected_key_inside_a_json_shaped_question_is_rejected() -> None:
+    """`extra="forbid"` must still reach the nested `Question` after coercion."""
+    payload = _json_reply()
+    payload["questions"][0]["mood"] = "chipper"
+
+    with pytest.raises(ValidationError) as excinfo:
+        InterviewPlan.model_validate(payload)
+
+    # Pydantic also reports a knock-on `too_short` for `questions` (the failed
+    # item never makes it into the tuple), so the assertion is on the error
+    # that actually names the offending key.
+    extra = [error for error in excinfo.value.errors() if error["type"] == "extra_forbidden"]
+    assert [error["loc"] for error in extra] == [("questions", 0, "mood")]
+
+
+def test_a_json_shaped_reply_still_lands_as_an_immutable_tuple() -> None:
+    """The lock against the tempting wrong fix.
+
+    `list[Question]` would accept the JSON reply just as happily - and then
+    `plan.questions.append(...)` would mutate state the whole model exists to
+    freeze. The field stays `tuple[Question, ...]`.
+    """
+    plan_model = InterviewPlan.model_validate(_json_reply())
+
+    with pytest.raises(AttributeError):
+        plan_model.questions.append(Question(text="One more?"))
+
+    assert len(plan_model.questions) == 5
+
+
+def test_a_blank_question_inside_a_json_shaped_reply_is_still_rejected() -> None:
+    """`AfterValidator(_non_blank)` has to run *after* the list-to-tuple step."""
+    payload = _json_reply()
+    payload["questions"][1] = {"text": "   "}
+
+    with pytest.raises(ValidationError) as excinfo:
+        InterviewPlan.model_validate(payload)
+
+    errors = excinfo.value.errors()
+    assert errors[0]["type"] == "value_error"
+    assert errors[0]["loc"] == ("questions", 1, "text")
 
 
 # --------------------------------------------------------------------------

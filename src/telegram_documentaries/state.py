@@ -30,6 +30,7 @@ from pydantic import (
 )
 
 from telegram_documentaries import observability
+from telegram_documentaries.interviewer import InterviewPlan, Question
 
 logger = observability.get_logger(__name__)
 
@@ -103,25 +104,6 @@ def _non_blank(value: str) -> str:
     if not value.strip():
         raise ValueError("must contain non-whitespace characters")
     return value
-
-
-class Question(_Frozen):
-    """One interview question, asked verbatim."""
-
-    text: Annotated[str, Field(min_length=1), AfterValidator(_non_blank)]
-
-
-class InterviewPlan(_Frozen):
-    """The questions and the animal, decided in a single Gemini call (R7.2).
-
-    Bounded to 5-7 questions so the dossier is bounded by construction and needs
-    no separate cap (R3.5).
-    """
-
-    questions: tuple[Question, ...] = Field(
-        min_length=_PLAN_QUESTION_BOUNDS[0], max_length=_PLAN_QUESTION_BOUNDS[1]
-    )
-    suggested_animal: Annotated[str, Field(min_length=1), AfterValidator(_non_blank)]
 
 
 class Answer(_Frozen):

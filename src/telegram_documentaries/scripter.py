@@ -221,14 +221,15 @@ async def _call(
         request, Narration, chat_id=chat_id, update_id=update_id
     )
     try:
-        return _validated(raw.text)
+        script = _validated(raw.text)
     except ScriptRejectedError as rejected:
         # Whether this is retryable is decided by `write`; logging here is
         # unconditional so the count is never lost. `write` raises again after
         # the retry, which is where the second one becomes an incident.
         logger.info(
-            "script rejected by local validation",
+            "script_rejected_retryable",
             extra={
+                "event": "script_rejected_retryable",
                 "chat_id": chat_id,
                 "update_id": update_id,
                 "stage": Stage.SCRIPTER,
@@ -236,6 +237,18 @@ async def _call(
             },
         )
         raise
+    else:
+        logger.info(
+            "script_written",
+            extra={
+                "event": "script_written",
+                "chat_id": chat_id,
+                "update_id": update_id,
+                "stage": Stage.SCRIPTER,
+                "word_count": script.word_count,
+            },
+        )
+        return script
 
 
 def _validated(text: str) -> Script:

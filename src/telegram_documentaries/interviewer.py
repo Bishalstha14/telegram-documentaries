@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Annotated
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
+from telegram_documentaries import observability
 from telegram_documentaries.gemini import GeminiClient, GeminiRequest, Stage
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
@@ -79,6 +80,8 @@ class InterviewPlan(_Frozen):
     ]
 
 
+logger = observability.get_logger(__name__)
+
 SYSTEM_INSTRUCTION = (
     "You write the interview for a comedic wildlife documentary about a person. "
     "You are given a brief description of the subject. Write the questions the "
@@ -130,9 +133,21 @@ async def plan(
         prompt=_prompt_for(subject),
     )
 
-    return await client.generate(
+    planned = await client.generate(
         request, InterviewPlan, chat_id=chat_id, update_id=update_id
     )
+
+    logger.info(
+        "interview_planned",
+        extra={
+            "event": "interview_planned",
+            "chat_id": chat_id,
+            "update_id": update_id,
+            "question_count": len(planned.questions),
+            "suggested_animal": planned.suggested_animal,
+        },
+    )
+    return planned
 
 
 class _TurnPrompt(_Frozen):

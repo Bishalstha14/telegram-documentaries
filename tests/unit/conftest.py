@@ -206,3 +206,48 @@ def fake_gemini() -> FakeGeminiClient:
     """An empty fake; queue replies per test."""
     return FakeGeminiClient()
 
+
+
+# --------------------------------------------------------------------------
+# The photo fetch port (R9.2)
+#
+# The hub depends on this Protocol rather than on python-telegram-bot, which is
+# what lets the whole decision table run with zero network access.
+# --------------------------------------------------------------------------
+
+
+class FakePhotoFetcher:
+    """Returns queued bytes, or raises the queued failure.
+
+    Args:
+        data: Bytes to hand back, in order. When the queue empties the default
+            blob is returned indefinitely, because a person can send a photo
+            many times in one conversation and running out would be the fake
+            failing rather than the code under test.
+        error: If set, every fetch raises this. Used for the transport-failure
+            path through the decision table.
+    """
+
+    DEFAULT = b"\xff\xd8fakejpeg\xff\xd9"
+
+    def __init__(
+        self,
+        data: list[bytes] | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.data = list(data or [])
+        self.error = error
+        self.fetched: list[Any] = []
+
+    async def fetch(self, attachment: Any) -> bytes:
+        self.fetched.append(attachment)
+        if self.error is not None:
+            raise self.error
+        return self.data.pop(0) if self.data else self.DEFAULT
+
+
+@pytest.fixture
+def fake_fetcher() -> FakePhotoFetcher:
+    """A fake fetcher with one queued photograph."""
+    return FakePhotoFetcher()

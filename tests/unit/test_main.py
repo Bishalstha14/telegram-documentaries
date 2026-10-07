@@ -139,9 +139,11 @@ class FakeGateway:
     def __init__(self) -> None:
         self.built: list[FakeApplication] = []
         self.tokens: list[str] = []
+        self.pipelines: list[Any] = []
 
-    def build(self, token: str) -> FakeApplication:
+    def build(self, token: str, pipeline: Any) -> FakeApplication:
         self.tokens.append(token)
+        self.pipelines.append(pipeline)
         application = FakeApplication(token)
         self.built.append(application)
         return application
@@ -162,8 +164,8 @@ def gateway(monkeypatch: pytest.MonkeyPatch) -> FakeGateway:
     """
     fake_gateway = FakeGateway()
 
-    def fake_build_application(token: str) -> FakeApplication:
-        return fake_gateway.build(token)
+    def fake_build_application(token: str, pipeline: Any) -> FakeApplication:
+        return fake_gateway.build(token, pipeline)
 
     monkeypatch.setattr("telegram_documentaries.bot.build_application", fake_build_application)
     return fake_gateway
@@ -229,6 +231,27 @@ def test_main_passes_the_configured_token_to_the_gateway(
 
     assert gateway.tokens == [TOKEN]
     assert gateway.latest.token == TOKEN
+
+
+def test_main_builds_and_injects_a_pipeline(
+    entry: Module,
+    valid_environment: None,
+    gateway: FakeGateway,
+) -> None:
+    """D10: the hub is assembled here and handed to the adapter, not built in it.
+
+    Asserted from `main()` rather than from `_build_pipeline`, because the
+    wiring is the thing that could silently break - `bot.py` growing a
+    `ConversationPipeline(...)` of its own would leave every test passing while
+    production used a second, unconfigured hub.
+    """
+    from telegram_documentaries.pipeline import ConversationPipeline
+
+    entry.main()
+
+    assert len(gateway.pipelines) == 1
+    pipeline = gateway.pipelines[0]
+    assert isinstance(pipeline, ConversationPipeline)
 
 
 def test_main_registers_a_post_init_hook_before_polling(

@@ -7,6 +7,14 @@
 credentials.json
 service-account*.json
 
+# SSH private keys (deploy keys used to push to GitHub)
+GITHUB-SSH-KEY.txt
+*_SSH_KEY.txt
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
 # Python
 .venv/
 venv/

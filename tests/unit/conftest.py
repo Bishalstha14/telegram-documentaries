@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -72,11 +74,22 @@ class FakeTelegramBot:
 
 
 class FakeContext:
-    """The subset of `telegram.ext.CallbackContext` the handlers read."""
+    """The subset of `telegram.ext.CallbackContext` the handlers read.
 
-    def __init__(self, bot: FakeTelegramBot | None = None) -> None:
+    `application` carries the injected pipeline (D10). The handlers reach it
+    through `context.application.pipeline`, exactly as they do in production,
+    so a test exercises the same lookup rather than a shortcut around it.
+    """
+
+    def __init__(
+        self,
+        bot: FakeTelegramBot | None = None,
+        *,
+        pipeline: Any | None = None,
+    ) -> None:
         self.bot = bot if bot is not None else FakeTelegramBot()
         self.error: BaseException | None = None
+        self.application = SimpleNamespace(pipeline=pipeline)
 
 
 @pytest.fixture
@@ -251,3 +264,22 @@ class FakePhotoFetcher:
 def fake_fetcher() -> FakePhotoFetcher:
     """A fake fetcher with one queued photograph."""
     return FakePhotoFetcher()
+
+
+@pytest.fixture
+def pipeline(tmp_path: Path) -> Any:
+    """A real `ConversationPipeline` wired entirely to fakes (R10).
+
+    Real, not a stub: the adapter's contract is "call the hub and send what it
+    returns", and a stub would assert only that the adapter calls a stub.
+    """
+    from telegram_documentaries.media import MediaStore
+    from telegram_documentaries.pipeline import ConversationPipeline
+    from telegram_documentaries.state import SessionStore
+
+    return ConversationPipeline(
+        client=FakeGeminiClient(),
+        sessions=SessionStore(),
+        media=MediaStore(base_dir=Path(tmp_path) / "media"),
+        fetcher=FakePhotoFetcher(),
+    )

@@ -882,6 +882,8 @@ async def test_gemini_failures_never_log_the_api_key(app_records: LogRecords) ->
     swept here; the assertion is that it never leaves in the other direction.
     Even a `repr`/`str` of the client itself must not carry it, so a future
     `logger.exception(..., extra={"client": client})` cannot leak it either.
+    The last case sweeps the real `httpx.Request` seam, where the key rides the
+    request's headers rather than any object we hand over.
     """
     failures = [
         httpx.ReadTimeout("timed out"),
@@ -901,6 +903,28 @@ async def test_gemini_failures_never_log_the_api_key(app_records: LogRecords) ->
         assert "SUPERSECRET" not in rendered
         assert "GEMINI-KEY" not in rendered
         assert API_KEY not in f"{client!r}{client!s}{exception_text}{exception_repr}"
+
+    # The real-`httpx.Request` seam: the scripted HTTP double sits inside a real
+    # `genai.Client`, which builds a genuine `httpx.Request` carrying the key in
+    # its `x-goog-api-key` header - so the key is in play on this path too, and a
+    # failure raised around that request must render neither the header, the
+    # request, nor the exception that replaced it.
+    app_records.records.clear()
+    body = json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL})
+    scripted = _ScriptedAsyncHttpClient(body)
+    raised = await _run_with_body(body, scripted)
+
+    assert app_records.records, "a failure must be logged, never silent"
+    assert scripted.last_request is not None, "the SDK must really have built a request"
+    assert scripted.last_request.headers.get("x-goog-api-key") == API_KEY, (
+        "premise: the key really rides this request, so the guard below is not vacuous"
+    )
+    rendered = _rendered(app_records.records)
+    assert API_KEY not in rendered
+    assert "SUPERSECRET" not in rendered
+    assert "GEMINI-KEY" not in rendered
+    assert isinstance(raised, GeminiResponseError)
+    assert API_KEY not in f"{raised!r}{raised!s}"
 
 
 async def test_gemini_failures_never_log_the_response_body(app_records: LogRecords) -> None:
@@ -1056,36 +1080,70 @@ class _ScriptedAsyncHttpClient(httpx.AsyncClient):
     exactly as they do in production. A body the SDK's parser rejects therefore
     fails where it would in production - *inside* `generate_content`, above
     `_typed_reply`.
+
+    The last real `httpx.Request` the SDK handed over is kept, because that is
+    where the API key travels (`x-goog-api-key`): a leak guard can then prove
+    the key really was in play on this seam rather than asserting against
+    nothing.
     """
 
     def __init__(self, body: str) -> None:
         super().__init__()
         self._body = body
+        self.last_request: httpx.Request | None = None
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        return httpx.Response(200, text=self._body, request=httpx.Request(method, url))
+        # Rebuild the request the SDK was about to send - same method, url,
+        # headers and body - so the double observes a genuine `httpx.Request`.
+        request = httpx.Request(
+            method, url, headers=kwargs.get("headers"), content=kwargs.get("content")
+        )
+        self.last_request = request
+        return httpx.Response(200, text=self._body, request=request)
 
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        self.last_request = request
         return httpx.Response(200, text=self._body, request=request)
 
 
-def _sdk_client_replaying(body: str) -> genai.Client:
-    """A real SDK client whose HTTP layer replays `body` as a 200."""
+def _sdk_client_replaying(
+    body: str,
+    scripted: _ScriptedAsyncHttpClient | None = None,
+) -> genai.Client:
+    """A real SDK client whose HTTP layer replays `body` as a 200.
+
+    `scripted` lets a test supply - and therefore keep a handle on - the HTTP
+    double, when it needs to inspect the `httpx.Request` the SDK built.
+    """
     return genai.Client(
         api_key=API_KEY,
-        http_options=types.HttpOptions(httpx_async_client=_ScriptedAsyncHttpClient(body)),
+        http_options=types.HttpOptions(
+            httpx_async_client=(
+                scripted if scripted is not None else _ScriptedAsyncHttpClient(body)
+            )
+        ),
     )
 
 
-def _sdk_parsing_transport(body: str) -> Any:
+def _sdk_parsing_transport(
+    body: str,
+    scripted: _ScriptedAsyncHttpClient | None = None,
+) -> Any:
     """The production transport, over a client that replays `body`."""
-    return gemini._GenAiTransport(_sdk_client_replaying(body))
+    return gemini._GenAiTransport(_sdk_client_replaying(body, scripted))
 
 
-async def _run_with_body(body: str) -> BaseException | None:
-    """Drive `generate` over `body`, returning whatever escaped the boundary."""
+async def _run_with_body(
+    body: str,
+    scripted: _ScriptedAsyncHttpClient | None = None,
+) -> Exception | None:
+    """Drive `generate` over `body`, returning whatever escaped the boundary.
+
+    `scripted`, when given, is the HTTP double the SDK client is built on, so a
+    test can inspect the real `httpx.Request` that call sent.
+    """
     try:
-        await _generate(_client(_sdk_parsing_transport(body)))
+        await _generate(_client(_sdk_parsing_transport(body, scripted)))
     except Exception as exc:
         return exc
     return None
@@ -1096,69 +1154,88 @@ async def _run_with_body(body: str) -> BaseException | None:
 #: `TypeError`, `AttributeError`. `usageMetadata` as a string is the shape most
 #: plausible from API/SDK version skew, and the sentinel rides in every body so
 #: a leak through `str(exc)` is detectable.
+#:
+#: Each parameter carries the escaping class *for that shape*, measured against
+#: google-genai 2.28.0: it is the class the catch-all reports in
+#: `GeminiResponseError.reason`, so a test asserting it is coupled to the real
+#: escaping failure rather than to "some typed error happened".
 _MALFORMED_200_BODIES = [
     pytest.param(
         json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL}),
+        "ValidationError",
         id="usage_metadata_is_a_string",
     ),
     pytest.param(
         json.dumps({"candidates": [{"content": {"parts": RESPONSE_BODY_SENTINEL}}]}),
+        "ValidationError",
         id="parts_is_a_string",
     ),
     pytest.param(
         f"{RESPONSE_BODY_SENTINEL} - this is not JSON at all",
+        "JSONDecodeError",
         id="not_json_at_all",
     ),
     pytest.param(
         json.dumps({"candidates": [RESPONSE_BODY_SENTINEL, 7]}),
+        "TypeError",
         id="candidates_contains_an_int",
     ),
     pytest.param(
         json.dumps(
             {"candidates": [{"content": {"parts": [{"text": {"a": RESPONSE_BODY_SENTINEL}}]}}]}
         ),
+        "AttributeError",
         id="text_is_an_object",
     ),
 ]
 
-#: The two documented trigger shapes: both carry the body in `str(exc)`, so
-#: both leak into a rendered traceback when the exception escapes.
+#: The ids of the shapes above whose `str(exc)` carries the raw body, so a leak
+#: through a rendered traceback is detectable. Derived from the sweep by id -
+#: the entries (and their escaping classes) are never restated, so the two
+#: lists cannot drift apart.
+_BODY_BEARING_IDS = frozenset(
+    {
+        "usage_metadata_is_a_string",
+        "parts_is_a_string",
+    }
+)
+
+#: The two shapes that carry the body in `str(exc)`: both leak into a rendered
+#: traceback when the exception escapes.
 _BODY_BEARING_200_BODIES = [
-    pytest.param(
-        json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL}),
-        id="usage_metadata_is_a_string",
-    ),
-    pytest.param(
-        json.dumps({"candidates": [{"content": {"parts": RESPONSE_BODY_SENTINEL}}]}),
-        id="parts_is_a_string",
-    ),
+    param for param in _MALFORMED_200_BODIES if param.id in _BODY_BEARING_IDS
 ]
 
 
 async def test_the_scripted_200_body_reaches_the_sdks_own_response_parser() -> None:
     """Premise: this double sits *below* the SDK's parsing, unlike `FakeTransport`.
 
-    If the seam ever moves back above parsing, this fails loudly and the tests
-    below are shown to be sweeping the same layer the old sentinel sweeps
-    already covered - i.e. nothing - rather than passing on a ghost.
+    Driven through `_run_with_body` - the same harness as the sweeps below - and
+    coupled to the escaping class name, so the claim is pinned to the mechanism
+    rather than to the double's own wiring: only a body the SDK's parser really
+    choked on can escape as `(ValidationError)`. If the seam ever moves back
+    above parsing, the reason this reports changes and the test fails loudly,
+    showing the sweeps below are sweeping the same layer the old sentinel
+    sweeps already covered - i.e. nothing - rather than passing on a ghost.
     """
-    client = _sdk_client_replaying(json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL}))
+    body = json.dumps({"usageMetadata": RESPONSE_BODY_SENTINEL})
 
-    with pytest.raises(ValidationError) as excinfo:
-        await client.aio.models.generate_content(
-            model=gemini.MODEL_ID,
-            contents=types.Content(role="user", parts=[types.Part.from_text(text="hi")]),
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
+    raised = await _run_with_body(body)
 
-    assert RESPONSE_BODY_SENTINEL in str(excinfo.value), (
-        "the SDK must really be parsing this body, and really be choking on it"
+    assert isinstance(raised, GeminiResponseError), (
+        "a malformed 200 must be a typed rejection, not an escape: "
+        f"got {type(raised).__name__}"
+    )
+    assert "ValidationError" in raised.reason, (
+        "the SDK must really be parsing this body, and really be choking on it - "
+        f"the boundary attributed it to {raised.reason!r} instead"
     )
 
 
-@pytest.mark.parametrize("body", _MALFORMED_200_BODIES)
+@pytest.mark.parametrize(("body", "escaping_class"), _MALFORMED_200_BODIES)
 async def test_a_malformed_200_body_the_sdk_cannot_read_is_a_typed_gemini_error(
     body: str,
+    escaping_class: str,
 ) -> None:
     """(i) Every SDK-side read failure becomes a `GeminiError`, never escapes.
 
@@ -1170,9 +1247,15 @@ async def test_a_malformed_200_body_the_sdk_cannot_read_is_a_typed_gemini_error(
     cannot read is a bad reply, not an outage (R1.6), so it is the loud class
     and the record is `gemini_reply_rejected`.
 
+    `escaping_class` couples each shape to *its* failure: the boundary reports
+    the class name of whatever escaped, so this asserts the escaping class the
+    SDK's parser really produced for this body - and fails if the seam moved
+    above parsing and a different class (or our own downstream rejection)
+    produced the message instead.
+
     `__suppress_context__` pins the *prevention mechanism*: the original is
     chained with `from None`, so no formatter can reach `str(exc)` - which for
-    three of these shapes carries the raw body.
+    two of these shapes carries the raw body.
     """
     raised = await _run_with_body(body)
 
@@ -1180,14 +1263,19 @@ async def test_a_malformed_200_body_the_sdk_cannot_read_is_a_typed_gemini_error(
         "the boundary must map the SDK's own parsing failure onto the taxonomy, "
         f"but a {type(raised).__name__} escaped"
     )
+    assert escaping_class in raised.reason, (
+        f"this body must escape as a {escaping_class} - the class the SDK's own "
+        f"parser raises for it - but the boundary reported {raised.reason!r}"
+    )
     assert raised.__suppress_context__, (
         "the original must be chained with `from None`, unreachable to a formatter"
     )
 
 
-@pytest.mark.parametrize("body", _BODY_BEARING_200_BODIES)
+@pytest.mark.parametrize(("body", "escaping_class"), _BODY_BEARING_200_BODIES)
 async def test_a_body_bearing_malformed_200_body_is_typed_and_never_logged(
     body: str,
+    escaping_class: str,
     app_records: LogRecords,
 ) -> None:
     """Both harms at once: a typed error *and* no body in any rendered record.
@@ -1195,6 +1283,11 @@ async def test_a_body_bearing_malformed_200_body_is_typed_and_never_logged(
     Asserted in leak-first order so a regression reports the blocking harm
     (R1.7 - the body rendered into the decorator's `exc_info`) rather than the
     taxonomy miss, which the test above already owns on its own.
+
+    The class-name coupling is load-bearing here too: without it, a regression
+    that stopped the SDK failure from escaping but raised an unrelated
+    `GeminiResponseError` would still satisfy "sentinel absent", and the test
+    would pass on a ghost.
     """
     raised = await _run_with_body(body)
 
@@ -1206,6 +1299,10 @@ async def test_a_body_bearing_malformed_200_body_is_typed_and_never_logged(
     assert isinstance(raised, GeminiResponseError), (
         "a raw SDK parsing error escaping also means the turn ends with no reply, "
         f"but a {type(raised).__name__} escaped"
+    )
+    assert escaping_class in raised.reason, (
+        f"this body must escape as a {escaping_class}, but the boundary "
+        f"reported {raised.reason!r}"
     )
 
 

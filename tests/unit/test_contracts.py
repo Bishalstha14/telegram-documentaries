@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from telegram import Update
 
 from telegram_documentaries import contracts
@@ -309,7 +309,499 @@ def test_invalid_inbound_update_is_a_value_error() -> None:
 
 
 def test_contracts_module_exports_only_the_public_surface() -> None:
+    """An exact set, so a new name has to be a deliberate public decision."""
     assert set(contracts.__all__) == {
+        "InboundAttachment",
         "InboundUpdate",
         "InvalidInboundUpdateError",
+        "MediaKind",
+        "PhotoAttachment",
+        "UnsupportedAttachment",
+        "validation_error_fields",
     }
+
+
+def test_contracts_no_longer_exposes_settings_error_fields() -> None:
+    """D7 / R2.4: the `.env`-specific name is gone, with no legacy shim.
+
+    A shim would keep the old vocabulary alive in `config`, invite its reuse for
+    Gemini replies, and make the next move harder to see. Asserting its absence
+    is what stops it creeping back.
+    """
+    assert not hasattr(contracts, "settings_error_fields")
+    assert "settings_error_fields" not in contracts.__all__
+
+
+def test_contracts_exposes_validation_error_fields() -> None:
+    assert callable(contracts.validation_error_fields)
+    assert contracts.validation_error_fields.__module__ == "telegram_documentaries.contracts"
+
+
+# --------------------------------------------------------------------------
+# R2.4 / D7 - the leak guard, generalised from `.env` keys to any model.
+#
+# This helper is the project's single mechanism for reading a pydantic error
+# safely. Gemini's off-schema reply fails validation exactly the way a missing
+# `.env` key does - the offending `input_value` carries a sibling secret - so it
+# is the same guard, re-used, rather than a copy.
+# --------------------------------------------------------------------------
+
+
+class _Probe(BaseModel):
+    """Three required fields, shaped like a Gemini stage reply."""
+
+    verdict: str
+    subject: str
+    line: str
+
+
+#: A distinctive marker standing in for a secret that must never be extracted.
+SIBLING_SECRET = "AIzaSUPERSECRET-SIBLING-SECRET-VALUE"
+
+
+def test_validation_error_fields_returns_names_only() -> None:
+    """The mechanism-level guard: field *names*, never values.
+
+    The premise is asserted first - that the raw error really does carry the
+    sibling value inside its own ``input_value`` - so this test cannot quietly
+    become vacuous if pydantic ever stops leaking.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        # `line` is missing, so pydantic reports the whole input mapping - which
+        # still holds the sibling secret in `subject`.
+        _Probe.model_validate({"verdict": "HUMAN", "subject": SIBLING_SECRET})
+    exc = excinfo.value
+
+    # Premise: the error object carries the sibling value inside `input_value`.
+    assert SIBLING_SECRET in str(exc.errors()), (
+        "the validation error no longer carries the sibling value; R2.4's handling "
+        "must be re-evaluated rather than quietly deleted"
+    )
+
+    fields = contracts.validation_error_fields(exc)
+
+    assert fields == ("line",)
+    for field in fields:
+        assert not field.strip().startswith("{")
+    assert SIBLING_SECRET not in ", ".join(fields)
+
+
+def test_validation_error_fields_keeps_order_and_deduplicates() -> None:
+    """Field names arrive in report order, once each - the message reads cleanly."""
+    exc = ValidationError.from_exception_data(
+        "_Probe",
+        [
+            {"type": "missing", "loc": ("verdict",), "input": None},
+            {"type": "missing", "loc": ("subject",), "input": None},
+            {"type": "missing", "loc": ("subject",), "input": None},
+        ],
+    )
+
+    assert contracts.validation_error_fields(exc) == ("verdict", "subject")
+
+
+def test_validation_error_fields_ignores_errors_with_no_field_location() -> None:
+    """A whole-model error carries no `loc`; a payload fragment must not stand in."""
+    exc = ValidationError.from_exception_data(
+        "_Probe",
+        [
+            {
+                "type": "greater_than",
+                "loc": (),
+                "input": {"secret": SIBLING_SECRET},
+                "ctx": {"gt": 0},
+            }
+        ],
+    )
+
+    assert contracts.validation_error_fields(exc) == ()
+    assert SIBLING_SECRET not in ", ".join(contracts.validation_error_fields(exc))
+
+
+def test_validation_error_fields_reports_the_outer_field_of_a_nested_error() -> None:
+    """A nested failure is reported by the field the caller actually owns."""
+    exc = ValidationError.from_exception_data(
+        "_Probe",
+        [{"type": "missing", "loc": ("verdict", 0, "text"), "input": None}],
+    )
+
+    assert contracts.validation_error_fields(exc) == ("verdict",)
+
+
+# --------------------------------------------------------------------------
+# R2 - the typed attachment union
+#
+# The decision table narrows on `attachment.kind` rather than inspecting a
+# payload, so the union is the whole reason the hub can live in the domain layer
+# instead of inside a Telegram handler.
+# --------------------------------------------------------------------------
+
+
+def _photo(size: int, **overrides: Any) -> dict[str, Any]:
+    """One Telegram photo size. `size` orders them ascending, as Telegram does."""
+    payload: dict[str, Any] = {
+        "file_id": f"photo-{size}",
+        "file_unique_id": f"unique-{size}",
+        "width": 90 * size,
+        "height": 90 * size,
+        "file_size": 1_000 * size,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _attachment_message(attachment_key: str, attachment: Any, **overrides: Any) -> Any:
+    """A message payload carrying `attachment_key`, wrapped for `Update.de_json`."""
+    payload = _message_payload(**overrides)
+    payload.pop("text", None)
+    payload[attachment_key] = attachment
+    return {"message": payload}
+
+
+def test_a_photo_message_carries_a_photo_attachment(make_update: Any) -> None:
+    update = make_update(**_attachment_message("photo", [_photo(1), _photo(2)]))
+
+    parsed = InboundUpdate.from_telegram(update)
+
+    assert parsed is not None
+    attachment = parsed.attachment
+    assert attachment is not None
+    assert attachment.kind == "photo"
+    assert attachment.file_id == "photo-2"
+    assert attachment.file_unique_id == "unique-2"
+    assert attachment.width == 180
+    assert attachment.height == 180
+    assert attachment.file_size == 2_000
+
+
+def test_the_largest_photo_is_selected_by_size_not_by_position(make_update: Any) -> None:
+    """R2.1: a reordered payload must not change which photo is judged."""
+    ascending = [_photo(1), _photo(2), _photo(3), _photo(4)]
+
+    parsed = InboundUpdate.from_telegram(
+        make_update(**_attachment_message("photo", ascending))
+    )
+
+    assert parsed is not None and parsed.attachment is not None
+    assert parsed.attachment.file_id == "photo-4"
+
+
+def test_a_reordered_photo_list_selects_the_same_photograph(make_update: Any) -> None:
+    ascending = [_photo(1), _photo(2), _photo(3), _photo(4)]
+    shuffled = [ascending[2], ascending[0], ascending[3], ascending[1]]
+
+    parsed = InboundUpdate.from_telegram(
+        make_update(**_attachment_message("photo", shuffled))
+    )
+
+    assert parsed is not None and parsed.attachment is not None
+    assert parsed.attachment.file_id == "photo-4"
+
+
+def test_a_missing_file_size_falls_back_to_pixel_area(make_update: Any) -> None:
+    """R2.1: `file_size` is optional, hence the `(file_size or 0, w*h)` order."""
+    small = _photo(1, file_size=None)
+    large = _photo(2, file_size=None)
+
+    parsed = InboundUpdate.from_telegram(
+        make_update(**_attachment_message("photo", [small, large]))
+    )
+
+    assert parsed is not None and parsed.attachment is not None
+    assert parsed.attachment.file_id == "photo-2"
+    assert parsed.attachment.file_size is None
+
+
+def test_a_larger_file_size_beats_a_larger_pixel_area(make_update: Any) -> None:
+    """The primary key is bytes; pixels only break a tie."""
+    few_big_pixels = {
+        "file_id": "big-pixels",
+        "file_unique_id": "u1",
+        "width": 4000,
+        "height": 4000,
+        "file_size": 10,
+    }
+    many_small_pixels = {
+        "file_id": "many-pixels",
+        "file_unique_id": "u2",
+        "width": 100,
+        "height": 100,
+        "file_size": 9_999,
+    }
+
+    parsed = InboundUpdate.from_telegram(
+        make_update(**_attachment_message("photo", [few_big_pixels, many_small_pixels]))
+    )
+
+    assert parsed is not None and parsed.attachment is not None
+    assert parsed.attachment.file_id == "many-pixels"
+
+
+def test_an_equal_file_size_is_broken_by_pixel_area(make_update: Any) -> None:
+    first = _photo(1, file_size=500)
+    second = _photo(3, file_size=500)
+
+    parsed = InboundUpdate.from_telegram(
+        make_update(**_attachment_message("photo", [first, second]))
+    )
+
+    assert parsed is not None and parsed.attachment is not None
+    assert parsed.attachment.file_id == "photo-3"
+
+
+def test_a_photo_with_a_blank_file_id_is_rejected(make_update: Any) -> None:
+    """R2.2: never a partially-populated attachment."""
+    broken = _photo(1, file_id="   ")
+
+    with pytest.raises(InvalidInboundUpdateError):
+        InboundUpdate.from_telegram(
+            make_update(**_attachment_message("photo", [broken]))
+        )
+
+
+def test_a_photo_with_a_non_positive_width_is_rejected(make_update: Any) -> None:
+    broken = _photo(1, width=0)
+
+    with pytest.raises(InvalidInboundUpdateError):
+        InboundUpdate.from_telegram(
+            make_update(**_attachment_message("photo", [broken]))
+        )
+
+
+def test_a_photo_with_a_negative_height_is_rejected(make_update: Any) -> None:
+    broken = _photo(1, height=-5)
+
+    with pytest.raises(InvalidInboundUpdateError):
+        InboundUpdate.from_telegram(
+            make_update(**_attachment_message("photo", [broken]))
+        )
+
+
+def test_a_photo_with_a_blank_unique_id_is_rejected(make_update: Any) -> None:
+    broken = _photo(1, file_unique_id="")
+
+    with pytest.raises(InvalidInboundUpdateError):
+        InboundUpdate.from_telegram(
+            make_update(**_attachment_message("photo", [broken]))
+        )
+
+
+def test_an_attachment_rejection_names_the_problem(make_update: Any) -> None:
+    broken = _photo(1, width=0)
+
+    with pytest.raises(InvalidInboundUpdateError) as caught:
+        InboundUpdate.from_telegram(
+            make_update(**_attachment_message("photo", [broken]))
+        )
+
+    assert caught.value.reason
+    assert caught.value.update_id == 4242
+
+
+# -- unsupported media ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_kind"),
+    [
+        ("sticker", "sticker"),
+        ("video", "video"),
+        ("audio", "audio"),
+        ("voice", "voice"),
+        ("animation", "animation"),
+        ("document", "document"),
+    ],
+)
+def test_a_recognised_media_kind_is_named(make_update: Any, key: str, expected_kind: str) -> None:
+    """R2: a closed set, so the reply can name what was sent without parsing."""
+    attachment_payload: dict[str, Any] = {
+        "file_id": "file-x",
+        "file_unique_id": "unique-x",
+        "width": 1,
+        "height": 1,
+        "duration": 1,
+    }
+    if key in {"audio", "voice"}:
+        attachment_payload.pop("width")
+        attachment_payload.pop("height")
+    if key == "document":
+        attachment_payload = {"file_name": "x.pdf", **attachment_payload}
+    if key == "sticker":
+        attachment_payload = {
+            "type": "regular",
+            "is_animated": False,
+            "is_video": False,
+            **attachment_payload,
+        }
+
+    update = make_update(**_attachment_message(key, attachment_payload))
+    parsed = InboundUpdate.from_telegram(update)
+
+    assert parsed is not None and parsed.attachment is not None
+    assert parsed.attachment.kind == "unsupported"
+    assert parsed.attachment.media_kind.value == expected_kind
+
+
+def test_a_media_kind_outside_the_closed_set_becomes_unknown(make_update: Any) -> None:
+    """R2: `unknown` is the honest label, not a crash and not a guess."""
+    update = make_update(
+        **_attachment_message(
+            "video_note",
+            {"file_id": "f", "file_unique_id": "u", "length": 5, "duration": 1},
+        )
+    )
+    parsed = InboundUpdate.from_telegram(update)
+
+    assert parsed is not None and parsed.attachment is not None
+    assert parsed.attachment.kind == "unsupported"
+    assert parsed.attachment.media_kind.value == "unknown"
+
+
+def test_a_message_with_no_media_and_no_text_has_no_attachment(make_update: Any) -> None:
+    payload = _message_payload()
+    payload.pop("text")
+
+    parsed = InboundUpdate.from_telegram(make_update(message=payload))
+
+    assert parsed is not None
+    assert parsed.attachment is None
+    assert parsed.text is None
+
+
+def test_a_plain_text_message_has_no_attachment(make_update: Any) -> None:
+    parsed = InboundUpdate.from_telegram(
+        make_update(message=_message_payload(text="hello"))
+    )
+
+    assert parsed is not None
+    assert parsed.attachment is None
+    assert parsed.text == "hello"
+
+
+# -- R2.3: a caption is never an answer -------------------------------------
+
+
+def test_a_photo_caption_is_not_mistaken_for_text(make_update: Any) -> None:
+    """R2.3: a caption arrives in `caption`, so it must not become an answer."""
+    payload = _attachment_message(
+        "photo", [_photo(1)], caption="this is my answer to question two"
+    )
+
+    parsed = InboundUpdate.from_telegram(make_update(**payload))
+
+    assert parsed is not None
+    assert parsed.attachment is not None
+    assert parsed.text is None
+
+
+def test_an_attachment_takes_precedence_over_text(make_update: Any) -> None:
+    """R2.3: when an attachment is present the hub ignores `text` entirely."""
+    payload = _attachment_message("photo", [_photo(1)])
+    payload["text"] = "should be ignored"
+
+    parsed = InboundUpdate.from_telegram(make_update(**payload))
+
+    assert parsed is not None
+    assert parsed.attachment is not None
+    assert parsed.text is None
+
+
+# -- the union itself -------------------------------------------------------
+
+
+def test_the_union_is_discriminated_on_kind() -> None:
+    from telegram_documentaries.contracts import PhotoAttachment, UnsupportedAttachment
+
+    photo = PhotoAttachment(
+        kind="photo",
+        file_id="a",
+        file_unique_id="b",
+        width=1,
+        height=1,
+        file_size=None,
+    )
+    other = UnsupportedAttachment(kind="unsupported", media_kind="sticker")
+
+    assert photo.kind == "photo"
+    assert other.kind == "unsupported"
+
+
+def test_photo_attachment_refuses_a_blank_file_id() -> None:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from telegram_documentaries.contracts import PhotoAttachment
+
+    with pytest.raises(PydanticValidationError):
+        PhotoAttachment(
+            kind="photo",
+            file_id="  ",
+            file_unique_id="b",
+            width=1,
+            height=1,
+            file_size=None,
+        )
+
+
+def test_photo_attachment_refuses_a_non_integer_width() -> None:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from telegram_documentaries.contracts import PhotoAttachment
+
+    with pytest.raises(PydanticValidationError):
+        PhotoAttachment(
+            kind="photo",
+            file_id="a",
+            file_unique_id="b",
+            width="10",  # type: ignore[arg-type]
+            height=1,
+            file_size=None,
+        )
+
+
+def test_the_media_kind_is_a_closed_str_enum() -> None:
+    from telegram_documentaries.contracts import MediaKind
+
+    assert [member.value for member in MediaKind] == [
+        "sticker",
+        "video",
+        "audio",
+        "voice",
+        "animation",
+        "document",
+        "unknown",
+    ]
+
+
+def test_an_unsupported_attachment_refuses_a_kind_outside_the_set() -> None:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from telegram_documentaries.contracts import UnsupportedAttachment
+
+    with pytest.raises(PydanticValidationError):
+        UnsupportedAttachment(kind="unsupported", media_kind="banana")
+
+
+def test_the_attachment_models_are_frozen() -> None:
+    from telegram_documentaries.contracts import PhotoAttachment
+
+    photo = PhotoAttachment(
+        kind="photo",
+        file_id="a",
+        file_unique_id="b",
+        width=1,
+        height=1,
+        file_size=None,
+    )
+
+    with pytest.raises(ValidationError):
+        photo.file_id = "changed"  # type: ignore[misc]
+
+
+def test_the_union_is_exported_from_the_contracts_surface() -> None:
+    for name in (
+        "PhotoAttachment",
+        "UnsupportedAttachment",
+        "InboundAttachment",
+        "MediaKind",
+    ):
+        assert name in contracts.__all__, name

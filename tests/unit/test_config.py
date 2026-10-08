@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from telegram_documentaries import config
+from telegram_documentaries import config, contracts
 
 # Distinctive marker: if this substring ever reaches a log, a rendered model or
 # an error message, a secret has leaked. It is not a plausible real token.
@@ -81,7 +81,7 @@ def test_settings_missing_both_keys_names_both_fields(monkeypatch: pytest.Monkey
     with pytest.raises(ValidationError) as excinfo:
         config.Settings(_env_file=None)
 
-    assert config.settings_error_fields(excinfo.value) == (
+    assert contracts.validation_error_fields(excinfo.value) == (
         "telegram_bot_token",
         "gemini_api_key",
     )
@@ -108,7 +108,7 @@ def test_settings_blank_key_is_rejected_as_missing(
     with pytest.raises(ValidationError) as excinfo:
         config.Settings(_env_file=None)
 
-    assert config.settings_error_fields(excinfo.value) == (field.lower(),)
+    assert contracts.validation_error_fields(excinfo.value) == (field.lower(),)
 
 
 def test_settings_blank_token_is_rejected_rather_than_silently_loaded(
@@ -184,7 +184,7 @@ def test_settings_validation_error_text_never_contains_the_secret_value(
     assert TOKEN in str(exc.errors()), "the validation error no longer carries the sibling secret"
 
     # Field names only, extracted from ValidationError.errors().
-    assert config.settings_error_fields(exc) == ("gemini_api_key",)
+    assert contracts.validation_error_fields(exc) == ("gemini_api_key",)
 
     message = config.settings_error_message(exc)
     assert "gemini_api_key" in message
@@ -231,5 +231,41 @@ def test_settings_error_fields_ignores_non_field_validation_errors() -> None:
         [{"type": "missing", "loc": ("gemini_api_key",), "input": None}],
     )
 
-    assert config.settings_error_fields(exc) == ("gemini_api_key",)
+    assert contracts.validation_error_fields(exc) == ("gemini_api_key",)
     assert TOKEN not in config.settings_error_message(exc)
+
+
+# --------------------------------------------------------------------------
+# D7 / R2.4 - the helper moved to `contracts`, and `config` keeps no shim.
+# --------------------------------------------------------------------------
+
+
+def test_config_no_longer_exposes_settings_error_fields() -> None:
+    """`config.settings_error_fields` is deleted, not aliased (D7).
+
+    The function is no longer `.env`-specific - Gemini's off-schema reply fails
+    validation the same way - so it now lives in the neutral `contracts` module
+    as `validation_error_fields`. Keeping the old name reachable here would let
+    the Gemini boundary grow a second, copy-pasted version of the leak guard.
+    """
+    assert not hasattr(config, "settings_error_fields")
+    assert "settings_error_fields" not in config.__all__
+
+
+def test_settings_error_message_still_names_fields_after_the_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The move changed the helper's home, not the message it produces."""
+    with pytest.raises(ValidationError) as excinfo:
+        config.Settings(_env_file=None)
+
+    message = config.settings_error_message(excinfo.value)
+
+    assert "telegram_bot_token" in message
+    assert "gemini_api_key" in message
+    assert TOKEN not in message
+    assert "SUPERSECRET" not in message
+    assert contracts.validation_error_fields(excinfo.value) == (
+        "telegram_bot_token",
+        "gemini_api_key",
+    )

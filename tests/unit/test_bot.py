@@ -30,6 +30,7 @@ from telegram import Message
 from telegram.error import NetworkError
 
 from telegram_documentaries import bot
+from telegram_documentaries.pipeline import WELCOME
 
 # `conftest`'s doubles are intentionally loose and `tests/` sits outside mypy's
 # scope, so fixtures and helpers here are deliberately unannotated.
@@ -100,6 +101,7 @@ def _everything_visible(record: logging.LogRecord) -> str:
 async def test_start_command_sends_the_greeting_to_the_integer_chat_id(
     start_update: UpdateFactory,
     fake_context: Context,
+    pipeline: Any,
 ) -> None:
     """R4.1: one outbound message, addressed to an `int` chat id.
 
@@ -107,6 +109,8 @@ async def test_start_command_sends_the_greeting_to_the_integer_chat_id(
     assertions. A string chat id would still "work" against the Bot API and would
     be found again only when session state keys on it in Phase 3.
     """
+    fake_context.application.pipeline = pipeline
+    fake_context.application.pipeline = pipeline
     await bot.on_start(start_update(), fake_context)
 
     assert len(fake_context.bot.sent) == 1
@@ -119,20 +123,28 @@ async def test_start_command_sends_the_greeting_to_the_integer_chat_id(
 async def test_start_reply_text_is_the_documented_greeting(
     start_update: UpdateFactory,
     fake_context: Context,
+    pipeline: Any,
 ) -> None:
-    """One documented constant, sent verbatim - no per-call string building."""
-    assert isinstance(bot.GREETING, str)
-    assert bot.GREETING.strip()
+    """One documented constant, sent verbatim - no per-call string building.
 
+    Retargeted at the hub's text (D10): the greeting is now a state-machine
+    outcome rather than a transport detail, so `bot` has no string of its own.
+    """
+    assert isinstance(WELCOME, str)
+    assert WELCOME.strip()
+
+    fake_context.application.pipeline = pipeline
+    fake_context.application.pipeline = pipeline
     await bot.on_start(start_update(), fake_context)
 
-    assert [sent["text"] for sent in fake_context.bot.sent] == [bot.GREETING]
+    assert [sent["text"] for sent in fake_context.bot.sent] == [WELCOME]
 
 
 async def test_the_greeting_is_not_sent_through_effective_message_reply_text(
     start_update: UpdateFactory,
     fake_context: Context,
     monkeypatch: pytest.MonkeyPatch,
+    pipeline: Any,
 ) -> None:
     """R4.1's other half: `reply_text` must never be the path the greeting takes.
 
@@ -147,15 +159,17 @@ async def test_the_greeting_is_not_sent_through_effective_message_reply_text(
 
     monkeypatch.setattr(Message, "reply_text", _forbidden_reply_text)
 
+    fake_context.application.pipeline = pipeline
     await bot.on_start(start_update(), fake_context)
 
     assert taken == []
-    assert [sent["text"] for sent in fake_context.bot.sent] == [bot.GREETING]
+    assert [sent["text"] for sent in fake_context.bot.sent] == [WELCOME]
 
 
 async def test_two_chats_each_receive_their_own_greeting(
     make_update: UpdateFactory,
     fake_context: Context,
+    pipeline: Any,
 ) -> None:
     """Isolation: a reply is addressed to the chat that asked, never a shared one."""
     first = make_update(update_id=6001, message=_start_message(chat={"id": 111, "type": "private"}))
@@ -163,6 +177,7 @@ async def test_two_chats_each_receive_their_own_greeting(
         update_id=6002, message=_start_message(chat={"id": CHAT_ID, "type": "supergroup"})
     )
 
+    fake_context.application.pipeline = pipeline
     await bot.on_start(first, fake_context)
     await bot.on_start(second, fake_context)
 
@@ -173,14 +188,21 @@ async def test_start_command_is_logged_with_both_correlation_ids(
     start_update: UpdateFactory,
     fake_context: Context,
     app_records: LogRecords,
+    pipeline: Any,
 ) -> None:
-    """The acceptance criterion for the happy path in validation.md section E."""
+    """The acceptance criterion for the happy path in validation.md section E.
+
+    The event is `start_received` (D10): the adapter now logs a uniform
+    `<entry>_received` for all three entry points rather than a bespoke name
+    per handler.
+    """
+    fake_context.application.pipeline = pipeline
     await bot.on_start(start_update(), fake_context)
 
     received = [
         app_records.extra_of(record)
         for record in app_records.at_level(logging.INFO)
-        if app_records.extra_of(record).get("event") == "start_command_received"
+        if app_records.extra_of(record).get("event") == "start_received"
     ]
     assert len(received) == 1
     assert received[0]["chat_id"] == CHAT_ID
@@ -191,14 +213,16 @@ async def test_a_successful_reply_is_logged_with_its_duration(
     start_update: UpdateFactory,
     fake_context: Context,
     app_records: LogRecords,
+    pipeline: Any,
 ) -> None:
+    fake_context.application.pipeline = pipeline
     await bot.on_start(start_update(), fake_context)
 
     events = {
         app_records.extra_of(record).get("event"): app_records.extra_of(record)
         for record in app_records.records
     }
-    reply = events["start_reply_sent"]
+    reply = events["reply_sent"]
     assert reply["chat_id"] == CHAT_ID
     assert reply["update_id"] == UPDATE_ID
     assert reply["duration_ms"] >= 0
@@ -329,6 +353,7 @@ async def test_missing_message_update_is_not_treated_as_malformed(
 async def test_a_send_failure_reaches_the_error_handler_with_full_context(
     start_update: UpdateFactory,
     app_records: LogRecords,
+    pipeline: Any,
 ) -> None:
     """R4.3 end to end: the error escapes the handler and is logged with its ids.
 
@@ -336,7 +361,7 @@ async def test_a_send_failure_reaches_the_error_handler_with_full_context(
     only that the failure is never silent.
     """
     failure = NetworkError("connection reset by peer")
-    context = FakeContext(ExplodingTelegramBot(failure))
+    context = FakeContext(ExplodingTelegramBot(failure), pipeline=pipeline)
     update = start_update()
 
     with pytest.raises(NetworkError):
@@ -417,29 +442,71 @@ async def test_the_error_handler_logs_loudly_even_when_there_is_no_exception(
 # --------------------------------------------------------------------------
 
 
-def test_build_application_registers_exactly_one_start_handler() -> None:
-    """One handler, for one command. Anything more is Phase 2's business."""
-    application = bot.build_application(FAKE_BOT_TOKEN)
+def test_three_handlers_are_registered_plus_one_error_handler(pipeline: Any) -> None:
+    """R9.3: `/start`, `/restart`, one catch-all, and `on_error`.
+
+    Three rather than one is the whole point of D10 - but three is also all.
+    There is deliberately no per-phase handler, because there is no per-phase
+    behaviour.
+    """
+    application = bot.build_application(FAKE_BOT_TOKEN, pipeline)
 
     handlers = [handler for group in application.handlers.values() for handler in group]
-    assert len(handlers) == 1
+    assert len(handlers) == 3
 
-    handler = handlers[0]
-    assert handler.commands == frozenset({"start"})
+    commands = {
+        handler.commands
+        for handler in handlers
+        if getattr(handler, "commands", None) is not None
+    }
+    assert commands == {frozenset({"start"}), frozenset({"restart"})}
 
+    catch_all = next(
+        handler for handler in handlers if getattr(handler, "commands", None) is None
+    )
+    assert catch_all.callback is bot.on_message
 
-def test_build_application_registers_the_start_callback_and_one_error_handler() -> None:
-    application = bot.build_application(FAKE_BOT_TOKEN)
-
-    handler = next(iter(next(iter(application.handlers.values()))))
-    assert handler.callback is bot.on_start
     assert len(application.error_handlers) == 1
     assert next(iter(application.error_handlers)) is bot.on_error
 
 
-def test_build_application_is_configured_for_long_polling() -> None:
+def test_the_two_command_callbacks_are_the_documented_ones(pipeline: Any) -> None:
+    application = bot.build_application(FAKE_BOT_TOKEN, pipeline)
+
+    by_command: dict[frozenset[str], Any] = {}
+    for group in application.handlers.values():
+        for handler in group:
+            commands = getattr(handler, "commands", None)
+            if commands is not None:
+                by_command[commands] = handler.callback
+
+    assert by_command[frozenset({"start"})] is bot.on_start
+    assert by_command[frozenset({"restart"})] is bot.on_restart
+
+
+def test_the_message_handler_is_registered_on_non_commands(pipeline: Any) -> None:
+    """R9.3: one handler covering text, photos and unsupported media alike."""
+    application = bot.build_application(FAKE_BOT_TOKEN, pipeline)
+
+    handlers = [handler for group in application.handlers.values() for handler in group]
+    catch_all = next(h for h in handlers if getattr(h, "commands", None) is None)
+
+    assert catch_all.callback is bot.on_message
+    # `~filters.COMMAND` is what keeps /start and /restart on their own handlers,
+    # so neither command can fall through to the decision table twice.
+    assert catch_all.filters is not None
+
+
+def test_the_pipeline_is_attached_to_the_application(pipeline: Any) -> None:
+    """D10: the hub is injected, so `bot.py` never constructs one."""
+    application = bot.build_application(FAKE_BOT_TOKEN, pipeline)
+
+    assert application.pipeline is pipeline
+
+
+def test_build_application_is_configured_for_long_polling(pipeline: Any) -> None:
     """An `Updater` is what makes `run_polling` possible; no webhook is set."""
-    application = bot.build_application(FAKE_BOT_TOKEN)
+    application = bot.build_application(FAKE_BOT_TOKEN, pipeline)
 
     assert application.updater is not None
 
@@ -453,6 +520,7 @@ async def test_no_log_record_anywhere_contains_the_bot_token(
     start_update: UpdateFactory,
     make_update: UpdateFactory,
     app_records: LogRecords,
+    pipeline: Any,
 ) -> None:
     """Every path - greeting, malformed, no message, failure - is token-free.
 
@@ -460,17 +528,25 @@ async def test_no_log_record_anywhere_contains_the_bot_token(
     token from a real `build_application` call, so the assertion covers the
     wiring and not just `on_start` in isolation.
     """
-    application = bot.build_application(FAKE_BOT_TOKEN)
-    registered = next(iter(next(iter(application.handlers.values()))))
+    application = bot.build_application(FAKE_BOT_TOKEN, pipeline)
+    registered = next(
+        handler
+        for group in application.handlers.values()
+        for handler in group
+        if getattr(handler, "commands", None) == frozenset({"start"})
+    )
+    context = FakeContext(pipeline=pipeline)
 
-    await registered.callback(start_update(), FakeContext())
+    await registered.callback(start_update(), context)
 
     malformed = start_update(update_id=5002, chat={"id": "nope", "type": "private"})
-    await registered.callback(malformed, FakeContext())
+    await registered.callback(malformed, context)
 
-    await registered.callback(make_update(update_id=5003), FakeContext())
+    await registered.callback(make_update(update_id=5003), context)
 
-    failing = FakeContext(ExplodingTelegramBot(NetworkError("connection reset")))
+    failing = FakeContext(
+        ExplodingTelegramBot(NetworkError("connection reset")), pipeline=pipeline
+    )
     update = start_update()
     with pytest.raises(NetworkError):
         await registered.callback(update, failing)
@@ -482,6 +558,21 @@ async def test_no_log_record_anywhere_contains_the_bot_token(
         assert FAKE_BOT_TOKEN not in _everything_visible(record)
 
 
-def test_the_greeting_constant_carries_no_credential() -> None:
-    """The one string that leaves the process must not be a place to hide a token."""
-    assert re.search(r"\d{5,}:[\w-]{20,}", bot.GREETING) is None
+def test_the_reply_text_constants_carry_no_credential() -> None:
+    """Retargeted at the hub's strings (D10), plus the adapter's own fallback.
+
+    Neither place can become somewhere a token hides: every string here is
+    sent verbatim to the user, so a credential in any of them would be
+    published straight into the chat.
+    """
+    from telegram_documentaries import pipeline as pipeline_module
+
+    for text in (
+        pipeline_module.WELCOME,
+        pipeline_module.PHOTO_REQUEST,
+        pipeline_module.SCRIPTED_NUDGE,
+        pipeline_module.RESTARTED,
+        pipeline_module.GENERIC_FAILURE,
+        pipeline_module.SCRIPT_FAILED,
+    ):
+        assert re.search(r"\d{5,}:[\w-]{20,}", text) is None, text

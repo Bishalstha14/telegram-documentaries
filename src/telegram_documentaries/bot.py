@@ -1,33 +1,44 @@
-"""The `/start` gateway: the bot's only behaviour in Phase 1.
+"""The Telegram adapter: parse, call the hub, send (R9.3).
 
-Everything here exists to honour three rules, in order of importance.
+Three handlers and one error handler. That is the whole surface.
+
+There is deliberately **no per-phase handler**. There is no per-phase behaviour -
+the phase is a field on the session, and the table that reads it lives in
+:mod:`telegram_documentaries.pipeline`. Each handler does exactly three things:
+parse the update through :meth:`InboundUpdate.from_telegram`, hand it to
+``pipeline.handle_*``, and send the single string that comes back. One send per
+update, always.
+
+Four rules, in order of how much they cost to get wrong:
 
 **The reply leaves through `context.bot.send_message`.**
-`update.effective_message.reply_text(...)` would be shorter, and it is the wrong
-call twice over. It hands a live library object to the handler instead of the
-typed :class:`~telegram_documentaries.contracts.InboundUpdate`, which is exactly
-the raw-payload leakage TECH.md forbids; and it hides the network call behind the
-message object, so the only way to test the handler is to let it reach Telegram.
-Sending through the `Bot` puts the mock boundary at the network seam, and the
-handler becomes testable with zero network access (R7).
+``update.effective_message.reply_text(...)`` is shorter and wrong twice over. It
+hands a live library object to the handler instead of the typed
+:class:`~telegram_documentaries.contracts.InboundUpdate` - the raw-payload
+leakage TECH.md forbids - and it hides the network call behind the message
+object, so the only way to test the handler is to let it reach Telegram.
 
 **A bad payload is loud in the logs and silent to the user.**
 `InvalidInboundUpdateError` is caught, logged with the offending `update_id`,
 and answered with nothing. No crash, no raise, and above all no invented default
-chat id to "keep going" - a wrong answer is worse than no answer.
+chat id: a wrong answer is worse than no answer.
+
+**A failed send never advances the session.**
+The session is only ever mutated inside the hub, and the hub returns text rather
+than sending. If the send itself raises, the decorator logs it and the error
+handler reports it - and the conversation is left exactly where it was, on a
+reply nobody received.
 
 **An exception escaping a handler is never silent.**
-An `error` handler reports it at `exception` level with the `chat_id` and
-`update_id` needed to find the request in Telegram's own logs. There is no
-per-stage user-facing degradation here; that is Phase 7 (R4.3).
+``on_error`` reports it at ``exception`` level with the `chat_id` and
+`update_id` needed to find the request in Telegram's own logs.
 
-Two smaller decisions worth stating, because neither is obvious:
+Two smaller decisions worth stating:
 
 * `@logged` decorates the *send*, not the whole handler. The decorator always
   stamps `chat_id`, `update_id` and `duration_ms`, and timing the network call is
-  the number actually worth having. The separate `start_command_received` record
-  is emitted the instant the payload is validated, before any I/O.
-* The `TypeAlias` block below exists only because strict `mypy` refuses a bare
+  the number actually worth having.
+* The `TypeAlias` block exists only because strict `mypy` refuses a bare
   `Application`. python-telegram-bot's generics are six deep; the exact shape the
   builder produces is spelled out once, here, instead of in every signature.
 """
@@ -36,25 +47,36 @@ from __future__ import annotations
 
 from typing import TypeAlias
 
-from telegram import Update
-from telegram.ext import Application, CallbackContext, CommandHandler, ExtBot, JobQueue
+from telegram import Bot, File, Update
+from telegram.ext import (
+    Application,
+    CallbackContext,
+    CommandHandler,
+    ExtBot,
+    JobQueue,
+    MessageHandler,
+    filters,
+)
 
 from telegram_documentaries import observability
-from telegram_documentaries.contracts import InboundUpdate, InvalidInboundUpdateError
+from telegram_documentaries.contracts import (
+    InboundUpdate,
+    InvalidInboundUpdateError,
+    PhotoAttachment,
+)
+from telegram_documentaries.pipeline import ConversationPipeline
 
-__all__ = ["GREETING", "GatewayApplication", "build_application", "on_error", "on_start"]
+__all__ = [
+    "GatewayApplication",
+    "TelegramPhotoFetcher",
+    "build_application",
+    "on_error",
+    "on_message",
+    "on_restart",
+    "on_start",
+]
 
 logger = observability.get_logger("bot")
-
-#: The single documented reply to `/start`. It must not overclaim: as of Phase 1
-#: the pipeline does not exist, and a greeting that promises a documentary would
-#: be a lie the user finds out about by sending a photo.
-GREETING = (
-    "Hello. The Telegram Documentaries bot is alive and talking to Telegram.\n\n"
-    "Right now that is all it does. The portrait-photo pipeline - the interview, "
-    "the hybrid animal portrait, the narration and the voice note - is not built "
-    "yet and arrives in a later phase."
-)
 
 # See the module docstring for why these exist.
 _Bot: TypeAlias = ExtBot[None]
@@ -72,35 +94,55 @@ GatewayApplication: TypeAlias = Application[
 ]
 
 
-@observability.logged("start_reply_sent")
-async def _send_greeting(chat_id: int, update_id: int, context: _Context) -> None:
-    """Send :data:`GREETING` to `chat_id` and time the call.
+class TelegramPhotoFetcher:
+    """The real implementation of the hub's `PhotoFetcher` port (R9.2).
+
+    The only place in the codebase that talks to Telegram's file API. The hub
+    sees a `PhotoAttachment` and gets bytes back; how those bytes travel is not
+    its business, which is what makes its decision table testable offline.
+    """
+
+    def __init__(self, client: Bot) -> None:
+        self._bot = client
+
+    async def fetch(self, attachment: PhotoAttachment) -> bytes:
+        """Download `attachment` and hand back its bytes.
+
+        Returns:
+            The photo's bytes. Telegram serves `photo` sizes as JPEG.
+
+        Raises:
+            Whatever `python-telegram-bot` raises on a failed download. The hub
+            catches it at its boundary and answers with a short line (R9.5);
+            this method does not translate the error, because a translated error
+            would be one more place a message can be written and get out of step
+            with the others.
+        """
+        telegram_file: File = await self._bot.get_file(attachment.file_id)
+        return bytes(await telegram_file.download_as_bytearray())
+
+
+@observability.logged("reply_sent")
+async def _send(chat_id: int, update_id: int, context: _Context, text: str) -> None:
+    """Send one reply and time the call.
 
     The parameter names are the point: `observability.logged` reads `chat_id` and
-    `update_id` off the call by name, so every `start_reply_sent` record carries
-    both correlation ids plus `duration_ms`, with no extra wiring.
+    `update_id` off the call by name, so every `reply_sent` record carries both
+    correlation ids plus `duration_ms`, with no extra wiring.
 
     If the send raises, the decorator logs the traceback and re-raises; the
-    application's `error` handler then reports `handler_failed`. Note that this
-    means a failed send also produces an ERROR-level `start_reply_sent` record -
-    the decorator is fixed contract, and `handler_failed` is what says the send
+    application's `error` handler then reports `handler_failed`. Note that a
+    failed send therefore also produces an ERROR-level `reply_sent` record - the
+    decorator is a fixed contract, and `handler_failed` is what says the send
     actually failed.
     """
-    await context.bot.send_message(chat_id=chat_id, text=GREETING)
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
-async def on_start(update: Update, context: _Context) -> None:
-    """Greet the user who sent `/start`.
-
-    Args:
-        update: The raw Telegram update. Untrusted until `from_telegram` says so.
-        context: The python-telegram-bot callback context. Only `context.bot` is
-            read, because that is the network seam.
-
-    Returns:
-        Nothing, and nothing is raised. A payload that cannot be trusted produces
-        a warning and no reply rather than a crash (R4.2).
-    """
+async def _dispatch(
+    update: Update, context: _Context, *, entry: str
+) -> None:
+    """Parse, call the hub, send. The only shape any handler has (R9.3)."""
     try:
         inbound = InboundUpdate.from_telegram(update)
     except InvalidInboundUpdateError as exc:
@@ -121,15 +163,81 @@ async def on_start(update: Update, context: _Context) -> None:
         # `inbound_update_ignored` is already logged at DEBUG by the contract.
         return
 
+    pipeline = _pipeline(context)
+    if pipeline is None:
+        # No pipeline injected: `build_application` is the only constructor and
+        # it always injects one, so this means the application was assembled by
+        # hand. Said loudly rather than answered with a crash mid-handler.
+        logger.error(
+            "pipeline_missing",
+            extra={
+                "event": "pipeline_missing",
+                "chat_id": inbound.chat_id,
+                "update_id": inbound.update_id,
+                "handler": entry,
+            },
+        )
+        return
+
     logger.info(
-        "start_command_received",
+        f"{entry}_received",
         extra={
-            "event": "start_command_received",
+            "event": f"{entry}_received",
             "chat_id": inbound.chat_id,
             "update_id": inbound.update_id,
         },
     )
-    await _send_greeting(chat_id=inbound.chat_id, update_id=inbound.update_id, context=context)
+
+    if entry == "start":
+        reply = await pipeline.handle_start(inbound)
+    elif entry == "restart":
+        reply = await pipeline.handle_restart(inbound)
+    else:
+        reply = await pipeline.handle_message(inbound)
+
+    await _send(
+        chat_id=inbound.chat_id, update_id=inbound.update_id, context=context, text=reply
+    )
+
+
+def _pipeline(context: _Context) -> ConversationPipeline | None:
+    """Read the injected hub out of the application (D10).
+
+    Kept in one place so the lookup has a single type annotation, and so a
+    missing pipeline is one check rather than three.
+    """
+    application = context.application
+    return getattr(application, "pipeline", None)
+
+
+async def on_start(update: Update, context: _Context) -> None:
+    """Handle `/start`: purge and ask for a portrait photo.
+
+    Args:
+        update: The raw Telegram update. Untrusted until `from_telegram` says so.
+        context: The callback context. Only `context.bot` and the injected
+            pipeline are read.
+
+    Returns:
+        Nothing, and nothing is raised. A payload that cannot be trusted produces
+        a warning and no reply rather than a crash (R4.2).
+    """
+    await _dispatch(update, context, entry="start")
+
+
+async def on_restart(update: Update, context: _Context) -> None:
+    """Handle `/restart`: wipe the session and the saved photo (D4)."""
+    await _dispatch(update, context, entry="restart")
+
+
+async def on_message(update: Update, context: _Context) -> None:
+    """Handle everything that is not a command: text, photos, other media.
+
+    Registered on `~filters.COMMAND`, so one handler covers every payload the
+    decision table has a row for (R9.3). There is no per-phase handler because
+    there is no per-phase behaviour - the phase is a field the hub reads.
+    """
+    await _dispatch(update, context, entry="message")
 
 
 async def on_error(update: object, context: _Context) -> None:
@@ -183,20 +291,34 @@ def _correlation_ids(update: object) -> tuple[int | None, int | None]:
     return chat_id, update_id
 
 
-def build_application(token: str) -> GatewayApplication:
-    """Build the long-polling application with its single `/start` handler.
+def build_application(
+    token: str, pipeline: ConversationPipeline
+) -> GatewayApplication:
+    """Build the long-polling application with its three handlers (D10).
 
     Args:
         token: The bot token. Already validated as non-blank by `Settings`; the
             value itself is never logged (R4.4).
+        pipeline: The hub. Injected rather than constructed here, so `bot.py`
+            depends on the domain rather than building it, and so a test can
+            pass a pipeline wired to fakes.
 
     Returns:
-        An `Application` carrying an `Updater`, so `run_polling` works. Exactly
-        one handler is registered - `/start` - plus one `error` handler. There is
-        deliberately no catch-all for other messages: out-of-order input handling
-        is Phase 2 (R4).
+        An `Application` carrying an `Updater`, so `run_polling` works.
+
+    Note:
+        Registration order is load-bearing. The two `CommandHandler`s are added
+        first, so `/start` and `/restart` are matched by them; the catch-all is
+        registered on `~filters.COMMAND`, which excludes both. One decision
+        table, no handler that has to know about phases.
     """
     application = Application.builder().token(token).build()
+    # Attached to the application rather than closed over: the handlers receive
+    # it through `context.application`, which keeps every callback a plain
+    # module-level function that a test can call directly.
+    application.pipeline = pipeline  # type: ignore[attr-defined]
     application.add_handler(CommandHandler("start", on_start))
+    application.add_handler(CommandHandler("restart", on_restart))
+    application.add_handler(MessageHandler(~filters.COMMAND, on_message))
     application.add_error_handler(on_error)
     return application

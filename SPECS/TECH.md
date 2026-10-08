@@ -30,6 +30,49 @@ what runs next.
   explicitly — never coerced into the current state.
 - Stage boundaries pass **typed models**, never raw dicts.
 
+### Two recorded divergences
+
+Both are deliberate. Neither should be "corrected" back without a new spec.
+
+**D1 — the Gemini calls go through `google.genai` directly, not ADK's `Runner`.**
+The project is written with ADK in its description, but every stage builds a
+typed `GeminiRequest` and calls `gemini.py`, which is the single importer of
+`google.genai`. `Runner` would mean agent objects, `LlmAgent` configuration and
+an async run loop around what is, at each stage, one structured call and one
+validated reply. The boundary contract — typed request in, validated model or
+one of two typed errors out — is the part that matters, and it is preserved
+exactly. If ADK is ever adopted, this is the seam to move, and the stages do
+not change.
+
+**D2 — dispatch lives in `pipeline.py`; the Interviewer is the hub, not the
+dispatch table.** The Interviewer decides *what the conversation does next*
+(ask, record, script), but "which `handle_*` method answers this update" is a
+separate concern and lives in one decision table in `pipeline.py`. Keeping them
+apart is what lets the decision table be tested with no Telegram, no Gemini and
+no filesystem: it takes an `InboundUpdate` and returns a string.
+`state.py` holds the phases and transitions as a plain class with no I/O, and
+imports the `Interviewer`'s types only under `TYPE_CHECKING` to keep the
+runtime dependency cycle one-way.
+
+### The photo port
+
+Photo bytes are fetched through one seam:
+
+```python
+class PhotoFetcher(Protocol):
+    async def fetch(self, attachment: PhotoAttachment) -> bytes: ...
+```
+
+Production uses `TelegramPhotoFetcher(Bot)` in `bot.py` — the only code in the
+project that talks to Telegram's file API. Tests pass a fake. The hub sees an
+`InboundUpdate` with a `PhotoAttachment` and gets bytes; *how* they travel is
+not its business, which is what makes its decision table testable offline.
+
+Note the port is typed against `Bot`, not `context.bot`: the hub needs it at
+construction time, which is before any handler — and therefore before any
+context — exists. `Bot` is a thin stateless HTTP client, so `__main__` builds a
+second one over the same token rather than reaching into the `Application`.
+
 ## Contracts at boundaries
 
 At every edge — parsing Telegram updates, parsing Gemini responses, parsing TTS

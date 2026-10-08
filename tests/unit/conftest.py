@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -72,11 +74,22 @@ class FakeTelegramBot:
 
 
 class FakeContext:
-    """The subset of `telegram.ext.CallbackContext` the handlers read."""
+    """The subset of `telegram.ext.CallbackContext` the handlers read.
 
-    def __init__(self, bot: FakeTelegramBot | None = None) -> None:
+    `application` carries the injected pipeline (D10). The handlers reach it
+    through `context.application.pipeline`, exactly as they do in production,
+    so a test exercises the same lookup rather than a shortcut around it.
+    """
+
+    def __init__(
+        self,
+        bot: FakeTelegramBot | None = None,
+        *,
+        pipeline: Any | None = None,
+    ) -> None:
         self.bot = bot if bot is not None else FakeTelegramBot()
         self.error: BaseException | None = None
+        self.application = SimpleNamespace(pipeline=pipeline)
 
 
 @pytest.fixture
@@ -138,3 +151,135 @@ def app_records() -> Iterator[LogRecorder]:
     finally:
         app_logger.removeHandler(recorder)
         app_logger.setLevel(previous_level)
+
+
+# --------------------------------------------------------------------------
+# Fake Gemini client
+#
+# The mock boundary for every stage: `generate` is the whole seam, so a fake
+# that records its calls and returns a canned reply means no test ever opens a
+# socket or spends a real API call. Stages receive this instead of
+# `GenAiGeminiClient`.
+# --------------------------------------------------------------------------
+
+
+class FakeGeminiClient:
+    """Records every `generate` call and returns whatever the test queued up.
+
+    Args:
+        replies: Replies to hand back, in order. A `BaseModel` is returned as
+            is; anything else is returned as given, so a test can queue an error
+            to raise or an off-schema value to reject.
+        error: If set, every call raises this. Used for transport-failure paths.
+    """
+
+    def __init__(
+        self,
+        replies: list[Any] | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.replies = list(replies or [])
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    async def generate(
+        self,
+        request: Any,
+        response_schema: type[Any],
+        chat_id: int,
+        update_id: int,
+    ) -> Any:
+        self.calls.append(
+            {
+                "request": request,
+                "response_schema": response_schema,
+                "chat_id": chat_id,
+                "update_id": update_id,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        if not self.replies:
+            raise AssertionError(
+                f"FakeGeminiClient ran out of replies after {len(self.calls)} call(s)"
+            )
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+@pytest.fixture
+def fake_gemini() -> FakeGeminiClient:
+    """An empty fake; queue replies per test."""
+    return FakeGeminiClient()
+
+
+
+# --------------------------------------------------------------------------
+# The photo fetch port (R9.2)
+#
+# The hub depends on this Protocol rather than on python-telegram-bot, which is
+# what lets the whole decision table run with zero network access.
+# --------------------------------------------------------------------------
+
+
+class FakePhotoFetcher:
+    """Returns queued bytes, or raises the queued failure.
+
+    Args:
+        data: Bytes to hand back, in order. When the queue empties the default
+            blob is returned indefinitely, because a person can send a photo
+            many times in one conversation and running out would be the fake
+            failing rather than the code under test.
+        error: If set, every fetch raises this. Used for the transport-failure
+            path through the decision table.
+    """
+
+    DEFAULT = b"\xff\xd8fakejpeg\xff\xd9"
+
+    def __init__(
+        self,
+        data: list[bytes] | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.data = list(data or [])
+        self.error = error
+        self.fetched: list[Any] = []
+
+    async def fetch(self, attachment: Any) -> bytes:
+        self.fetched.append(attachment)
+        if self.error is not None:
+            raise self.error
+        return self.data.pop(0) if self.data else self.DEFAULT
+
+
+@pytest.fixture
+def fake_fetcher() -> FakePhotoFetcher:
+    """A fake fetcher with one queued photograph."""
+    return FakePhotoFetcher()
+
+
+@pytest.fixture
+def pipeline(tmp_path: Path) -> Any:
+    """A real `ConversationPipeline` wired entirely to fakes (R10).
+
+    Real, not a stub: the adapter's contract is "call the hub and send what it
+    returns", and a stub would assert only that the adapter calls a stub.
+    """
+    from telegram_documentaries.media import MediaStore
+    from telegram_documentaries.pipeline import ConversationPipeline
+    from telegram_documentaries.state import SessionStore
+
+    return ConversationPipeline(
+        client=FakeGeminiClient(),
+        sessions=SessionStore(),
+        media=MediaStore(base_dir=Path(tmp_path) / "media"),
+        fetcher=FakePhotoFetcher(),
+    )

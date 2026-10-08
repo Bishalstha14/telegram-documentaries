@@ -33,13 +33,15 @@ something inferred from a traceback, and keeps `python -m` free of a
 from __future__ import annotations
 
 from pydantic import ValidationError
+from telegram import Bot
 
 from telegram_documentaries import bot, observability
-from telegram_documentaries.config import (
-    Settings,
-    settings_error_fields,
-    settings_error_message,
-)
+from telegram_documentaries.config import Settings, settings_error_message
+from telegram_documentaries.contracts import validation_error_fields
+from telegram_documentaries.gemini import GenAiGeminiClient
+from telegram_documentaries.media import MediaStore
+from telegram_documentaries.pipeline import ConversationPipeline
+from telegram_documentaries.state import SessionStore
 
 __all__ = ["ConfigurationError", "load_settings", "main"]
 
@@ -73,7 +75,7 @@ def load_settings() -> Settings:
         # Field names only. `str(exc)` is never touched - see the module
         # docstring for exactly what it would leak.
         raise ConfigurationError(
-            settings_error_message(exc), settings_error_fields(exc)
+            settings_error_message(exc), validation_error_fields(exc)
         ) from exc
 
 
@@ -93,6 +95,30 @@ async def _log_gateway_started(application: bot.GatewayApplication) -> None:
             "event": "gateway_started",
             "bot_username": application.bot.username,
         },
+    )
+
+
+def _build_pipeline(settings: Settings) -> ConversationPipeline:
+    """Assemble the hub with every real dependency (D10).
+
+    The four collaborators are built here rather than inside the adapter, so
+    `bot.py` depends on the domain and never constructs it.
+
+    Note:
+        The photo port needs a `Bot` before `build_application` has built the
+        `Application` that owns one, so the fetcher gets a second `Bot` over the
+        same token. `Bot` is a thin stateless HTTP client, so this costs one
+        connection pool rather than any correctness - and it keeps the port
+        constructible in a test with nothing but a fake. The token is read from
+        `settings` and, like everywhere else, never logged (R4.4).
+    """
+    return ConversationPipeline(
+        client=GenAiGeminiClient(
+            api_key=settings.gemini_api_key.get_secret_value()
+        ),
+        sessions=SessionStore(),
+        media=MediaStore(),
+        fetcher=bot.TelegramPhotoFetcher(Bot(settings.telegram_bot_token.get_secret_value())),
     )
 
 
@@ -130,7 +156,8 @@ def main() -> int:
     # `get_secret_value` is the only way to read a `SecretStr`, and the value
     # goes straight from here into the Telegram client. It is never logged,
     # never formatted into a message, and never stored (R4.4).
-    application = bot.build_application(settings.telegram_bot_token.get_secret_value())
+    token = settings.telegram_bot_token.get_secret_value()
+    application = bot.build_application(token, _build_pipeline(settings))
     application.post_init = _log_gateway_started
     application.run_polling()
     return 0

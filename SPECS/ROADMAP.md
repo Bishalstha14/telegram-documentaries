@@ -64,6 +64,18 @@ message, and reset state on rejection.
 
 **Rubric:** happy path (partial), out-of-order input.
 
+**Delivered (2026-10-05), as part of the text vertical slice.** `bouncer.py`
+turns photo bytes into a typed verdict through `gemini.py`; the decision itself
+lives in `pipeline.py`, which is where "human → advance, otherwise → reject and
+reset" is written down once. `/start` asks for a photo; a text message arriving
+first is nudged back to the conversation rather than treated as an answer
+(out-of-order input); an unreadable photo is answered with one short line and
+logged, never crashed on. The user-facing text comes from `pipeline.py`'s
+constants, so no stage owns a string.
+
+Verified by `tests/unit/test_pipeline.py` and `tests/unit/test_bouncer.py`
+against a fake transport — zero network.
+
 ---
 
 ## Phase 3 — Interviewer
@@ -79,6 +91,17 @@ Sequential stateful Q&A, dossier summary, suggested animal.
 - `/restart` mid-interview purges state and temp media with no process restart.
 
 **Rubric:** happy path, `/restart` reset, out-of-order input, isolation.
+
+**Delivered (2026-10-05), as part of the text vertical slice.**
+`interviewer.py` holds `plan()` and `next_question()` with a schema-level 5–7
+question rule; `state.py` holds `Phase`, `SessionStore` and every transition, as
+a plain class with no I/O so illegal transitions can be asserted directly rather
+than inferred from a mock. `/restart` purges the session *and* the stored photo
+without a process restart, and two chats never see each other's answers. The
+dossier accumulates one answer at a time; the suggested animal is produced when
+the Scripter asks for it.
+
+Verified by `tests/unit/test_interviewer.py` and `tests/unit/test_state.py`.
 
 ---
 
@@ -108,6 +131,16 @@ One-paragraph dramatic narration.
 
 **Rubric:** happy path.
 
+**Delivered (2026-10-05) as text — the delivery is what remains.**
+`scripter.py` writes the 60–90 word narration, counts the words locally rather
+than trusting the model, and allows exactly one corrective retry that restates
+the bounds and the rejected count. A second failure is reported, never padded,
+truncated or replaced with a canned sentence. **What is not delivered:** the
+narration currently arrives as a Telegram *text* message. Sending it onward to
+the Converter (Phase 4) and the Narrator (Phase 6) is the remaining work.
+
+Verified by `tests/unit/test_scripter.py`, including both retry outcomes.
+
 ---
 
 ## Phase 6 — Narrator
@@ -136,6 +169,11 @@ Hardening across the whole pipeline.
 
 **Rubric:** all criteria.
 
+**Partially delivered (2026-10-05).** The first criterion — `/start` and
+`/restart` both purge state and temp files — and the third's happy path are
+met by the text slice. Timeout/rate-limit fallbacks and the cross-stage guards
+belong to the hardening pass and are outstanding.
+
 ---
 
 ## Status
@@ -143,9 +181,14 @@ Hardening across the whole pipeline.
 | Phase | Name | Status |
 |-------|------|--------|
 | 1 | Repository & gateway | **Complete** (verified live) |
-| 2 | Bouncer | Not started |
-| 3 | Interviewer | Not started |
+| 2 | Bouncer | **Complete** (text slice; 474 tests green) |
+| 3 | Interviewer | **Complete** (text slice; 474 tests green) |
 | 4 | Converter | Not started |
-| 5 | Scripter | Not started |
+| 5 | Scripter | **Complete as text** — narration arrives as a message; image and voice delivery remain |
 | 6 | Narrator | Not started |
-| 7 | Resilience | Not started |
+| 7 | Resilience | Partial — purge criteria met; timeout fallbacks and stage guards outstanding |
+
+**Live smoke test of the text slice: pending.** The code and the test suite are
+complete; the phone test (photo → 5–7 questions → narration → `/restart`) has
+not been run yet, so Phase 2/3/5 are marked complete on the suite alone. They
+are re-marked "verified live" once that test passes.

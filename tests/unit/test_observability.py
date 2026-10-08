@@ -192,6 +192,137 @@ async def test_logged_reraises_a_coroutine_exception(records: _Recorder) -> None
     assert isinstance(context["duration_ms"], float)
 
 
+# --- D8: static `extra` context, merged into every record ------------------
+
+
+def test_logged_merges_static_extra_into_every_record(records: _Recorder) -> None:
+    """D8: `stage` and `model` on every Gemini record, without a `log.info`.
+
+    The static keys must appear *alongside* the computed correlation context, not
+    instead of it - a record missing `chat_id` would be worse than no record.
+    """
+
+    @observability.logged(
+        "gemini_call",
+        extra={"stage": "bouncer", "model": "gemini-3.1-flash-lite"},
+    )
+    def handler(chat_id: int, update_id: int) -> str:
+        return "done"
+
+    assert handler(chat_id=1, update_id=2) == "done"
+
+    emitted = _at_level(records, logging.INFO)
+    assert len(emitted) == 1
+    context = _extra(emitted[0])
+    assert context["stage"] == "bouncer"
+    assert context["model"] == "gemini-3.1-flash-lite"
+    assert context["event"] == "gemini_call"
+    assert context["chat_id"] == 1
+    assert context["update_id"] == 2
+    assert isinstance(context["duration_ms"], float)
+
+
+def test_logged_merges_static_extra_onto_the_failure_record(records: _Recorder) -> None:
+    """The failure record is the one that matters for diagnosing a Gemini outage."""
+
+    @observability.logged("gemini_call", extra={"stage": "scripter"})
+    def handler(chat_id: int, update_id: int) -> None:
+        raise _SentinelError("boom")
+
+    with pytest.raises(_SentinelError):
+        handler(chat_id=3, update_id=4)
+
+    failures = _at_level(records, logging.ERROR)
+    assert len(failures) == 1
+    context = _extra(failures[0])
+    assert context["stage"] == "scripter"
+    assert context["event"] == "gemini_call"
+    assert context["chat_id"] == 3
+    assert context["update_id"] == 4
+
+
+async def test_logged_merges_static_extra_onto_an_async_record(records: _Recorder) -> None:
+    @observability.logged("gemini_call", extra={"stage": "interviewer"})
+    async def handler(chat_id: int, update_id: int) -> str:
+        return "done"
+
+    assert await handler(chat_id=4, update_id=5) == "done"
+
+    context = _extra(_at_level(records, logging.INFO)[0])
+    assert context["stage"] == "interviewer"
+    assert context["chat_id"] == 4
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    ["message", "levelname", "msg", "name", "created", "exc_info", "levelno", "pathname"],
+)
+def test_logged_static_extra_cannot_overwrite_a_reserved_record_attribute(
+    records: _Recorder,
+    reserved: str,
+) -> None:
+    """A reserved key must be dropped, never merged.
+
+    Merging one makes `logging.Logger.makeRecord` raise `KeyError` *while the
+    record is being built*, so a single careless `extra={"message": ...}` would
+    turn every call of the decorated function into a crash. The decorator's job
+    is to make that mistake impossible, not merely visible.
+    """
+
+    @observability.logged("reserved_probe", extra={reserved: "HIJACKED"})
+    def handler(chat_id: int, update_id: int) -> str:
+        return "done"
+
+    # Must not raise while the record is constructed.
+    assert handler(chat_id=9, update_id=10) == "done"
+
+    record = _at_level(records, logging.INFO)[0]
+    assert getattr(record, reserved, None) != "HIJACKED"
+    # The record itself is intact: message, level and logger all still correct.
+    assert record.getMessage() == "reserved_probe"
+    assert record.levelname == "INFO"
+    assert record.name == observability.LOGGER_NAME
+
+
+def test_logged_computed_context_wins_over_a_colliding_static_key(records: _Recorder) -> None:
+    """`event` / `chat_id` / `update_id` / `duration_ms` are the contract.
+
+    A static key with one of those names is dropped rather than allowed to
+    replace a real correlation id with a literal.
+    """
+
+    @observability.logged(
+        "shadow_probe",
+        extra={"chat_id": "static", "update_id": "static", "event": "static"},
+    )
+    def handler(chat_id: int, update_id: int) -> None:
+        return None
+
+    handler(chat_id=5, update_id=6)
+
+    context = _extra(_at_level(records, logging.INFO)[0])
+    assert context["chat_id"] == 5
+    assert context["update_id"] == 6
+    assert context["event"] == "shadow_probe"
+    assert isinstance(context["duration_ms"], float)
+
+
+def test_logged_does_not_mutate_the_caller_supplied_extra_mapping(records: _Recorder) -> None:
+    """The mapping belongs to the caller; the decorator only ever reads it."""
+
+    supplied: dict[str, object] = {"stage": "bouncer"}
+    before = dict(supplied)
+
+    @observability.logged("mutation_probe", extra=supplied)
+    def handler(chat_id: int, update_id: int) -> None:
+        return None
+
+    handler(chat_id=7, update_id=8)
+    handler(chat_id=9, update_id=10)
+
+    assert supplied == before
+
+
 # --- R5: fieldless calls still emit a coherent record ---------------------
 
 

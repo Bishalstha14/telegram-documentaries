@@ -16,7 +16,7 @@ import inspect
 import logging
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, TypeVar, cast
 
 __all__ = ["LOGGER_NAME", "configure_logging", "get_logger", "logged"]
@@ -51,6 +51,10 @@ _RESERVED_RECORD_ATTRS = frozenset(
         "threadName",
     }
 )
+
+#: Context this decorator computes itself. A caller-supplied static key matching
+#: one of these is dropped, so it can never replace a real correlation id.
+_COMPUTED_CONTEXT_ATTRS = frozenset({"event", "chat_id", "update_id", "duration_ms"})
 
 _P = TypeVar("_P")
 _R = TypeVar("_R")
@@ -101,11 +105,40 @@ class _KeyValueFormatter(logging.Formatter):
         return f"{base} | {rendered}"
 
 
+def _static_context(
+    extra: Mapping[str, object] | None,
+    computed: frozenset[str],
+) -> dict[str, object]:
+    """The caller's static `extra` keys, minus anything unsafe to merge.
+
+    Two classes of key are dropped rather than merged:
+
+    * anything that is a ``LogRecord`` attribute, because
+      ``logging.Logger.makeRecord`` raises ``KeyError`` on those *while building
+      the record* - a single ``extra={"message": ...}`` would turn every call of
+      the decorated function into a crash;
+    * anything that collides with the computed context this decorator owns
+      (``event``, ``chat_id``, ``update_id``, ``duration_ms``), because a static
+      literal must never replace a real correlation id.
+
+    Dropping, not raising: the mistake stays invisible, which is the point. The
+    caller's mapping is only read, never modified.
+    """
+    if not extra:
+        return {}
+    return {
+        key: value
+        for key, value in extra.items()
+        if key not in _RESERVED_RECORD_ATTRS and key not in computed
+    }
+
+
 def logged(
     event: str,
     *,
     chat_id: str = "chat_id",
     update_id: str = "update_id",
+    extra: Mapping[str, object] | None = None,
 ) -> Callable[[Callable[..., _R]], Callable[..., _R]]:
     """Instrument a sync or async callable with a structured log line.
 
@@ -114,9 +147,17 @@ def logged(
     callable's own parameter names, so the context lines up with the domain
     vocabulary; pass the keyword explicitly for any other source.
 
+    ``extra`` supplies *static* key-value context for every record this
+    decorator emits - the Gemini boundary's ``stage`` and ``model``, for
+    instance. It exists so a call site does not have to force a ``log.info`` into
+    business logic just to stamp its own identity onto the record (D8). Keys that
+    would overwrite a ``LogRecord`` attribute, or that collide with the computed
+    context above, are dropped; see :func:`_static_context`.
+
     An exception is logged at ``ERROR`` with traceback and re-raised unchanged.
     This decorator never converts a failure into a success.
     """
+    static = _static_context(extra, _COMPUTED_CONTEXT_ATTRS)
 
     def decorate(func: Callable[..., _R]) -> Callable[..., _R]:
         def _context(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, Any]:
@@ -135,18 +176,14 @@ def logged(
             exc_info: Any = None,
         ) -> None:
             call_chat_id, call_update_id = _context(args, kwargs)
-            logger.log(
-                level,
-                "%s",
-                event,
-                extra={
-                    "event": event,
-                    "chat_id": call_chat_id,
-                    "update_id": call_update_id,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-                },
-                exc_info=exc_info,
-            )
+            context: dict[str, object] = {
+                "event": event,
+                "chat_id": call_chat_id,
+                "update_id": call_update_id,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+            }
+            context.update(static)
+            logger.log(level, "%s", event, extra=context, exc_info=exc_info)
 
         if inspect.iscoroutinefunction(func):
 

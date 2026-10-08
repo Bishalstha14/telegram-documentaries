@@ -22,18 +22,82 @@ Two failure modes, deliberately distinct:
 * **A malformed message** (no chat, or ``chat.id`` not an integer) - an
   ``InvalidInboundUpdateError`` is raised. The caller decides how to tell the
   user; it must never invent a default chat id to keep going.
+
+Why ``validation_error_fields`` lives here
+------------------------------------------
+Any pydantic ``ValidationError`` renders the offending ``input_value``, so
+printing ``str(exc)`` leaks whatever was in the input - including a sibling
+secret. That is true of a missing ``.env`` key and equally true of an
+off-schema Gemini reply, which is why this module owns the one safe reader and
+both callers reuse it (D7).
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, StrictInt
+from enum import StrEnum
+from typing import Annotated
+
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+)
 from telegram import Update
 
 from telegram_documentaries import observability
 
-__all__ = ["InboundUpdate", "InvalidInboundUpdateError"]
+__all__ = [
+    "InboundAttachment",
+    "InboundUpdate",
+    "InvalidInboundUpdateError",
+    "MediaKind",
+    "PhotoAttachment",
+    "UnsupportedAttachment",
+    "validation_error_fields",
+]
 
 logger = observability.get_logger("contracts")
+
+
+def _non_blank(value: str) -> str:
+    """Reject whitespace-only text; `min_length=1` alone accepts `"   "`."""
+    if not value.strip():
+        raise ValueError("must contain non-whitespace characters")
+    return value
+
+
+def validation_error_fields(exc: ValidationError) -> tuple[str, ...]:
+    """Return only the offending field *names*, de-duplicated, in order.
+
+    Never return ``str(exc)`` to a caller, a log or stdout. For a missing key
+    pydantic renders the whole input mapping, which includes the sibling
+    secret's value::
+
+        1 validation error for Settings
+        gemini_api_key
+          Field required [type=missing,
+          input_value={'telegram_bot_token': 'SUPERSECRET'}, input_type=dict]
+
+    ``ValidationError.errors()`` is the only safe source: it carries the same
+    field locations, and this function reads nothing else from it.
+
+    Args:
+        exc: The validation failure to summarise. Only field *locations* are read.
+
+    Returns:
+        The offending field names, in report order and without duplicates. An
+        error with no location contributes nothing - a payload fragment must never
+        stand in for a field name.
+    """
+    names: list[str] = []
+    for error in exc.errors():
+        location = error.get("loc", ())
+        if location:
+            names.append(str(location[0]))
+    return tuple(dict.fromkeys(names))
 
 
 class InvalidInboundUpdateError(ValueError):
@@ -51,6 +115,79 @@ class InvalidInboundUpdateError(ValueError):
         self.update_id = update_id
 
 
+class MediaKind(StrEnum):
+    """The kinds of media the bot will name back to the user (R2).
+
+    A closed set rather than a free string, so the reply can say "a sticker"
+    without parsing anything - and so a typo in the parser cannot reach the
+    user's screen as an unhandled label.
+    """
+
+    STICKER = "sticker"
+    VIDEO = "video"
+    AUDIO = "audio"
+    VOICE = "voice"
+    ANIMATION = "animation"
+    DOCUMENT = "document"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def of(cls, message: object) -> MediaKind:
+        """Name the media carried by `message`, or report `UNKNOWN`.
+
+        Reads the Telegram media fields by name rather than by enumeration of
+        the payload, so a media type Telegram adds next year lands in `UNKNOWN`
+        instead of being mistaken for something the bot understands.
+        """
+        for field, member in (
+            ("sticker", cls.STICKER),
+            ("video", cls.VIDEO),
+            ("audio", cls.AUDIO),
+            ("voice", cls.VOICE),
+            ("animation", cls.ANIMATION),
+            ("document", cls.DOCUMENT),
+        ):
+            if getattr(message, field, None) is not None:
+                return member
+        return cls.UNKNOWN
+
+
+class PhotoAttachment(BaseModel):
+    """A portrait photo, with the largest size already selected (R2.1).
+
+    `StrictInt` for the numeric fields: a width of `"90"` is not a width, and
+    accepting it would let a malformed payload reach the pixel-area tiebreak as
+    something other than a number.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    kind: str = "photo"
+    file_id: Annotated[str, Field(min_length=1), AfterValidator(_non_blank)]
+    file_unique_id: Annotated[str, Field(min_length=1), AfterValidator(_non_blank)]
+    width: StrictInt = Field(gt=0)
+    height: StrictInt = Field(gt=0)
+    file_size: StrictInt | None = Field(default=None, gt=0)
+
+
+class UnsupportedAttachment(BaseModel):
+    """Media the bot does not handle, named for the reply (R2).
+
+    Note:
+        Not an error. Sending a sticker is a normal thing for a person to do,
+        and the reply's job is to say what it saw, not to complain.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    kind: str = "unsupported"
+    media_kind: MediaKind
+
+
+#: The hub narrows on `kind`, so both arms must be reachable from one annotation.
+InboundAttachment = PhotoAttachment | UnsupportedAttachment
+
+
 class InboundUpdate(BaseModel):
     """A Telegram update: validated, typed and immutable.
 
@@ -66,8 +203,11 @@ class InboundUpdate(BaseModel):
     update_id: StrictInt
     #: Telegram chat identifier. Typed ``int``, never ``str`` - see module docs.
     chat_id: StrictInt
-    #: Message text, when the message carries any.
+    #: Message text, when the message carries any and no attachment took
+    #: precedence (R2.3 - a photo's caption lives in `caption`, never here).
     text: str | None = None
+    #: The message's media, already typed, or `None` for a plain text message.
+    attachment: InboundAttachment | None = None
 
     @classmethod
     def from_telegram(cls, update: Update) -> InboundUpdate | None:
@@ -119,7 +259,137 @@ class InboundUpdate(BaseModel):
                 update_id=update.update_id,
             )
 
-        return cls(update_id=update.update_id, chat_id=raw_chat_id, text=_text_of(message))
+        attachment = _attachment_of(message, update_id=update.update_id)
+
+        # R2.3: when an attachment is present the hub ignores `text` entirely.
+        # Stated in code, not only in prose, so a later change to this line
+        # cannot quietly turn a caption or a stray text field into an answer.
+        text = None if attachment is not None else _text_of(message)
+
+        return cls(
+            update_id=update.update_id,
+            chat_id=raw_chat_id,
+            text=text,
+            attachment=attachment,
+        )
+
+
+def _attachment_of(message: object, *, update_id: int) -> InboundAttachment | None:
+    """Type the message's media, or report that it carries none (R2).
+
+    Args:
+        message: The parsed `telegram.Message`.
+        update_id: Correlation key for the rejection, if one is needed.
+
+    Returns:
+        A `PhotoAttachment` when a photo is present - largest size selected by
+        `(file_size or 0, width * height)` so a reordered payload cannot change
+        which photograph is judged (R2.1) - an `UnsupportedAttachment` naming
+        anything else, or `None` for a plain text message.
+
+    Raises:
+        InvalidInboundUpdateError: A `PhotoSize` is malformed - a blank
+            `file_id` or a non-positive dimension. Raised rather than skipped,
+            so a broken photo is never judged as if it were a smaller valid one
+            (R2.2).
+    """
+    photo = getattr(message, "photo", None)
+    if photo:
+        chosen = _largest_photo(photo, update_id=update_id)
+        return PhotoAttachment(
+            file_id=_required_str(chosen, "file_id", update_id=update_id),
+            file_unique_id=_required_str(chosen, "file_unique_id", update_id=update_id),
+            width=_positive_int(chosen, "width", update_id=update_id),
+            height=_positive_int(chosen, "height", update_id=update_id),
+            file_size=_optional_size(chosen),
+        )
+
+    if any(getattr(message, field, None) is not None for field in _MEDIA_FIELDS):
+        return UnsupportedAttachment(media_kind=MediaKind.of(message))
+
+    return None
+
+
+#: Every Telegram media field the parser looks for. Deliberately wider than
+#: `MediaKind`'s named set: a field listed here but not named by `MediaKind.of`
+#: becomes `UNKNOWN`, which is an honest answer. A field *missing* from this
+#: list would be answered with "that was not a photo", which is a wrong one.
+_MEDIA_FIELDS = (
+    "sticker",
+    "video",
+    "audio",
+    "voice",
+    "animation",
+    "document",
+    "video_note",
+    "contact",
+    "dice",
+    "game",
+    "poll",
+    "location",
+    "venue",
+)
+
+
+def _largest_photo(sizes: object, *, update_id: int) -> object:
+    """Pick the largest size by bytes, then pixels (R2.1).
+
+    Not by list position: Telegram currently sends up to four sizes ascending,
+    but "currently" is not a contract, and a reordered payload must not change
+    which photograph is judged. `file_size` is optional, hence `or 0`, and the
+    pixel area only ever breaks a tie.
+    """
+    if not isinstance(sizes, (list, tuple)) or not sizes:
+        raise InvalidInboundUpdateError(
+            "photo has no sizes to choose from", update_id=update_id
+        )
+
+    ranked: list[tuple[int, int, object]] = []
+    for candidate in sizes:
+        width = _positive_int(candidate, "width", update_id=update_id)
+        height = _positive_int(candidate, "height", update_id=update_id)
+        size = getattr(candidate, "file_size", None)
+        byte_size = size if isinstance(size, int) and not isinstance(size, bool) else 0
+        ranked.append((byte_size, width * height, candidate))
+
+    return max(ranked, key=lambda entry: (entry[0], entry[1]))[2]
+
+
+def _required_str(source: object, field: str, *, update_id: int) -> str:
+    value = getattr(source, field, None)
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidInboundUpdateError(
+            f"photo.{field} must be a non-blank string", update_id=update_id
+        )
+    return value
+
+
+def _positive_int(source: object, field: str, *, update_id: int) -> int:
+    """Read a strictly positive int, rejecting bools and strings alike.
+
+    `isinstance(True, int)` is `True` in Python, so the bool check comes first
+    - a `true` where a width belongs is a malformed payload, not a one.
+    """
+    value = getattr(source, field, None)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise InvalidInboundUpdateError(
+            f"photo.{field} must be a positive int, got {value!r}",
+            update_id=update_id,
+        )
+    return value
+
+
+def _optional_size(source: object) -> int | None:
+    """`file_size` is optional; a malformed one is treated as absent.
+
+    Deliberately lenient where the dimensions are not: the size only ranks an
+    otherwise valid photograph, so an unusable figure narrows the tiebreak
+    rather than invalidating the photo.
+    """
+    value = getattr(source, "file_size", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 def _text_of(message: object) -> str | None:

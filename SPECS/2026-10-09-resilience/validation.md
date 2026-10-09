@@ -65,8 +65,8 @@ checkable by a command or by reading one named file — not by trusting a summar
 # the retry, alone — and prove it is fast (no real sleeping)
 .venv/bin/python -m pytest tests/unit/test_gemini.py -k throttle -v
 
-# the matrix, alone
-.venv/bin/python -m pytest tests/unit/test_resilience_matrix.py -v
+# the matrix, alone (a parametrized block in test_pipeline.py, per plan.md TG4)
+.venv/bin/python -m pytest tests/unit/test_pipeline.py -k matrix -v
 
 # the retry bound is a named, testable constant
 grep -n "_THROTTLE_MAX_ATTEMPTS\|_THROTTLE_BASE_DELAY_SECONDS\|_sleep" \
@@ -104,15 +104,26 @@ slice and the narrator.
 Pre-registered candidates to check:
 
 1. **Whether the retry lives in `_call_transport` as planned, or had to move.**
-   If a second SDK seam is found in TG2's sweep, the loop moves and this file
-   records where and why.
-2. **Whether the matrix found an unguarded cell.** If so, the fix is recorded
-   here as an instance of the same category.
-3. **Whether the silent-except guard found anything.** If it did, both the
-   finding and the fix are recorded; if it found nothing, that is stated
-   explicitly with the count of handlers inspected.
-4. **Whether the `429` is 0.1–0.6 s as measured.** If any throttle is slow, the
-   "three attempts cost ~3 s" claim in `requirements.md` D2 is corrected.
+   It stayed there. TG2's H2 sweep confirmed `_call_transport` is the *only*
+   seam through which the SDK is called — `_generate_content` and `_synthesize`
+   both route through it — so the single loop covers every stage, exactly as
+   planned (commits `cacc30b`, and the TG1 groundwork `1ebc883`).
+2. **Whether the matrix found an unguarded cell.** It found exactly one: the
+   `SCRIPTED × text` row answered with `SCRIPTED_NUDGE` but logged nothing, so
+   its cell could only be proven to have run by its reply. Fixed by giving the
+   row a `scripted_nudge` record like every other row (`8f344c7`, commit message
+   records it). No other cell needed a change — the remaining eight behaved as
+   defined the first time.
+3. **Whether the silent-except guard found anything.** It found nothing: all 26
+   `except` handlers across the 14 files under `src/` react (log or raise).
+   The guard is nonetheless real — its self-test makes it fire on all three
+   shapes (bare `except:`, `except X: pass`, `except X: ...`) before the
+   real-tree assertion is even reached (`dba456f`).
+4. **Whether the `429` is 0.1–0.6 s as measured.** Unchanged and uncorrected:
+   every image-model probe in the Phase 4 feasibility pass returned the `429` in
+   0.1–0.6 s, which is the basis for the "three attempts cost ~3 s" claim in
+   `requirements.md` D2. Nothing this phase ran contradicts it (the retry tests
+   substitute the `_sleep` seam and never wait).
 
 ## Merge criteria
 

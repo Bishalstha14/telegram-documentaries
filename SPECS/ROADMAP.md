@@ -117,6 +117,18 @@ Hybrid animal portrait, fused from the real photo and the dossier.
 
 **Rubric:** happy path.
 
+**Blocked (verified 2026-10-08) on image-generation quota — a billing matter,
+not a code one.** Every image-capable model on the project's API key returns
+`429 RESOURCE_EXHAUSTED: generate_content_free_tier_requests`:
+`gemini-3.1-flash-image`, `gemini-2.5-flash-image`,
+`gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and
+`gemini-3-pro-image-preview` were all probed, and Google's published plans list
+the free tier as *not available* for image generation. Enabling billing makes
+the feature runnable as specified — at roughly **$0.067 per portrait** by the
+schedule's pricing; the call shape, the typed-reply parsing and the graceful
+degradation are all already written and waiting. The phase resumes when the key
+has billing, no code change anticipated.
+
 ---
 
 ## Phase 5 — Scripter
@@ -131,13 +143,15 @@ One-paragraph dramatic narration.
 
 **Rubric:** happy path.
 
-**Delivered (2026-10-05) as text — the delivery is what remains.**
+**Delivered (2026-10-05 for the text; 2026-10-08 for delivery).**
 `scripter.py` writes the 60–90 word narration, counts the words locally rather
 than trusting the model, and allows exactly one corrective retry that restates
 the bounds and the rejected count. A second failure is reported, never padded,
-truncated or replaced with a canned sentence. **What is not delivered:** the
-narration currently arrives as a Telegram *text* message. Sending it onward to
-the Converter (Phase 4) and the Narrator (Phase 6) is the remaining work.
+truncated or replaced with a canned sentence. Delivery is complete: the
+narration reaches the user as a Telegram **voice note** voiced by Phase 6's
+Narrator (voice `Kore`, MP3 encoded in-process with `lameenc`), and when speech
+synthesis fails the narration still reaches the user as text (D6 / D-V4). The
+Converter path (Phase 4) remains the only outstanding leg.
 
 Verified by `tests/unit/test_scripter.py`, including both retry outcomes.
 
@@ -155,6 +169,17 @@ TTS synthesis and audio delivery. **Not an agent** — a direct function.
 
 **Rubric:** happy path.
 
+**Delivered (2026-10-08), live-verified.** Four criteria met: the script routes
+to `gemini-3.1-flash-tts-preview`; audio is rendered in-process to MP3 via
+`lameenc` (no system encoder); the voice note goes to the conversation's own
+`chat_id`; and a synthesis failure degrades to the narration as text (D6).
+Verified live against `@BishalTech_bot` — the end-to-end run logged
+`narration_delivered` then `voice_note_sent`, and a received voice note played
+the narration. The follow-up timeout fix (`fb2b675`) gave synthesis its own
+60 s budget — a live voice note had twice died on the shared 20 s text ceiling —
+regression-guarded and live-retested on the fixed code. See
+`SPECS/2026-10-08-narrator-voice-note/`.
+
 ---
 
 ## Phase 7 — Resilience
@@ -169,10 +194,17 @@ Hardening across the whole pipeline.
 
 **Rubric:** all criteria.
 
-**Partially delivered (2026-10-05).** The first criterion — `/start` and
-`/restart` both purge state and temp files — and the third's happy path are
-met by the text slice. Timeout/rate-limit fallbacks and the cross-stage guards
-belong to the hardening pass and are outstanding.
+**Delivered (2026-10-09).** `/start` and `/restart` purge state and temp media,
+every (phase × payload) row of the decision table has a defined outcome proven
+cell-by-cell by the matrix test, wrong-payload guards cover every state, and
+the two API-failure fallbacks ship: a bounded backoff retry for `429`s (at most
+three attempts, 1 s then 2 s — the only failure the transport re-attempts) and
+per-class timeouts (text 20 s, synthesis 60 s). A spent throttle is answered
+with a "try again" line, the one reply that never says `/restart`, because the
+session is held for a resend. A silent-failure guard walks `src/` and refuses
+any `except:` that swallows — bare `except:`, or a body of only `pass`/`...` —
+and is self-tested so it cannot rot. See
+`SPECS/2026-10-09-resilience/`. Suite: 608 tests, ruff, mypy strict.
 
 ---
 
@@ -181,14 +213,17 @@ belong to the hardening pass and are outstanding.
 | Phase | Name | Status |
 |-------|------|--------|
 | 1 | Repository & gateway | **Complete** (verified live) |
-| 2 | Bouncer | **Complete** (text slice; 474 tests green) |
-| 3 | Interviewer | **Complete** (text slice; 474 tests green) |
-| 4 | Converter | Not started |
-| 5 | Scripter | **Complete as text** — narration arrives as a message; image and voice delivery remain |
-| 6 | Narrator | Not started |
-| 7 | Resilience | Partial — purge criteria met; timeout fallbacks and stage guards outstanding |
+| 2 | Bouncer | **Complete** (text slice; part of the 608-test suite) |
+| 3 | Interviewer | **Complete** (text slice; part of the 608-test suite) |
+| 4 | Converter | **Blocked** — image-generation quota on the API key (`429 generate_content_free_tier_requests` on every image model); resumes when billing is enabled |
+| 5 | Scripter | **Complete** — delivered as a voice note (`lameenc`, voice `Kore`); Converter leg still blocked |
+| 6 | Narrator | **Complete** — verified live: `narration_delivered` + `voice_note_sent`, timeout fix `fb2b675` |
+| 7 | Resilience | **Complete** — per-class timeouts, bounded 429 retry, wrong-payload matrix, no-silent-except guard; 608 tests green |
 
-**Live smoke test of the text slice: pending.** The code and the test suite are
-complete; the phone test (photo → 5–7 questions → narration → `/restart`) has
-not been run yet, so Phase 2/3/5 are marked complete on the suite alone. They
-are re-marked "verified live" once that test passes.
+**Live verification: done.** The end-to-end flow — portrait photo → Bouncer →
+5–7 questions → narration → **voice note** — ran against the live bot
+`@BishalTech_bot`: the run logged `narration_delivered` then `voice_note_sent`,
+and the received voice note played the narration. Phase 2/3/5/6 are complete on
+the suite *and* live-verified; Phase 7 is complete on the suite. The one
+outstanding leg is Phase 4, blocked on image-generation quota (see the Phase 4
+entry).

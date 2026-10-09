@@ -140,6 +140,11 @@ tests inject a fake and never touch a socket. The production implementation
 `google.genai`. Construction takes the API key, a timeout in milliseconds, and
 builds one `genai.Client` with `http_options=types.HttpOptions(timeout=...)`.
 
+> **Superseded by the voice phase.** The Narrator's `synthesize` widened this
+> protocol to a second method — TTS returns audio, not schema-bound JSON
+> (`SPECS/2026-10-08-narrator-voice-note/requirements.md`, D-V2). One seam, one
+> injected object; recorded as a divergence rather than a contradiction.
+
 **R1.3 — Replies are schema-first.** Every call sets
 `response_mime_type="application/json"` and passes the stage's Pydantic model as
 `response_schema`, and the client's return type is that same model type. This is
@@ -464,6 +469,12 @@ text. **One send per update.** If a reply exceeds Telegram's 4096-character
 limit the hub's text is already bounded (R8.1) and the adapter asserts nothing;
 it sends what it is given.
 
+> **Superseded by the voice phase.** The narration's delivery widened the
+> returned type to `Reply = str | VoiceNote` — a voice note is not a string, and
+> only the type widens; "one reply per update" is preserved
+> (`SPECS/2026-10-08-narrator-voice-note/requirements.md`, D-V1). Recorded as a
+> divergence, not left as a contradiction.
+
 **R9.4 — The old signature and constant are gone (D10).**
 `build_application(token, pipeline)`. `GREETING` is deleted from `bot.py`; the
 `/start` text is now a hub output that promises only what exists. The Phase 1
@@ -644,6 +655,13 @@ Recorded after the plan was approved, each with the reason it happened.
     `.txt` filename. The file itself was left untouched, but a later `git add .`
     would have committed a private key. This is repo hygiene rather than a
     spec deviation, recorded here because it happened inside this change.
+11. **The voice phase superseded two of this slice's contracts** (the one-method
+    `GeminiClient`, R1.2, and `Reply = str`, R9.3). The Narrator needs a TTS
+    method that returns audio and a reply type that can carry a voice note, and
+    both are recorded as deliberate divergences — D-V1 and D-V2 — in
+    `SPECS/2026-10-08-narrator-voice-note/requirements.md`, with in-line
+    cross-references at R1.2 and R9.3 above. The intent of each original
+    requirement — one injected seam, one reply per update — is unchanged.
 
 ## Required documentation changes in this phase
 

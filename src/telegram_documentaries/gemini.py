@@ -35,13 +35,20 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Sequence
 from enum import StrEnum
-from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
+from typing import Annotated, Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 from telegram_documentaries import observability
 from telegram_documentaries.contracts import validation_error_fields
@@ -58,6 +65,9 @@ __all__ = [
     "GenAiGeminiClient",
     "ImageMimeType",
     "Stage",
+    "SynthesisRequest",
+    "SynthesizedAudio",
+    "VoiceName",
 ]
 
 logger = observability.get_logger("gemini")
@@ -85,6 +95,11 @@ _SchemaT = TypeVar("_SchemaT", bound=BaseModel)
 #: attacker-shaped value cannot reach the SDK as a free string (R1.1).
 ImageMimeType = Literal["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]
 
+#: The three TTS voices verified in this repository, and no others (D2). A
+#: closed set, so a typo is a `mypy` failure rather than a runtime surprise -
+#: exactly the boundary `ImageMimeType` draws for images.
+VoiceName = Literal["Kore", "Fenrir", "Charon"]
+
 
 class Stage(StrEnum):
     """Which pipeline stage a call belongs to. The log correlation field."""
@@ -92,6 +107,7 @@ class Stage(StrEnum):
     BOUNCER = "bouncer"
     INTERVIEWER = "interviewer"
     SCRIPTER = "scripter"
+    NARRATOR = "narrator"
 
 
 class GeminiRequest(BaseModel):
@@ -112,6 +128,139 @@ class GeminiRequest(BaseModel):
     #: The portrait, for the Bouncer only. Bytes, never a path or a `FileId`.
     image: bytes | None = None
     image_mime_type: ImageMimeType = "image/jpeg"
+
+
+class SynthesisRequest(BaseModel):
+    """One TTS call's worth of input, typed and frozen (R1.2).
+
+    Deliberately *not* :class:`GeminiRequest`. That model's
+    `system_instruction` is mandatory, and a speech request has no system
+    instruction to give it - using it here would mean fabricating one. Its shape
+    genuinely differs, so it gets its own model.
+
+    `extra="forbid"` for the same reason as :class:`GeminiRequest`: a misspelled
+    field on the way in would otherwise be silently dropped and produce audio
+    nobody can explain.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: The narration to read aloud.
+    text: str = Field(min_length=1)
+    #: The voice to read it in. A closed set (D2).
+    voice: VoiceName
+
+
+def _require_even_length(data: bytes) -> bytes:
+    """Reject a PCM payload that is not whole little-endian `s16le` frames (R1.3).
+
+    A frame is two bytes, so an odd byte count can only be a truncation;
+    downstream arithmetic would otherwise invent a half-sample.
+    """
+    if len(data) % 2:
+        raise ValueError("must be a whole number of s16le frames")
+    return data
+
+
+class _AudioMime(BaseModel):
+    """The typed shape of the TTS model's MIME declaration (R1.3).
+
+    The model returns exactly ``audio/l16; rate=24000; channels=1``. The
+    parameters arrive as strings, so a value that is not an integer
+    (``rate=fast``) is refused here rather than reaching the arithmetic that
+    derives `duration_seconds`. `channels` is pinned to 1 because the PCM
+    downstream is mono: a stereo payload would otherwise be timed as though it
+    were not, and the note would play at the wrong speed.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    media_type: Literal["audio/l16"]
+    rate: int = Field(gt=0)
+    channels: Annotated[int, Field(ge=1, le=1)]
+
+
+def _parse_audio_mime(mime_type: str) -> _AudioMime:
+    """Parse a MIME declaration into typed parameters, without a regex (R1.3).
+
+    The string is split on ``;``; the leading segment is the media type and each
+    later segment is split on ``=`` into a parameter. The resulting mapping is
+    validated by :class:`_AudioMime`, so an unexpected media type, a
+    non-integer rate or a channel count other than 1 is a ``ValidationError`` -
+    never a value that slips downstream and is mis-timed.
+
+    Args:
+        mime_type: The declaration as the SDK reported it, e.g.
+            ``audio/l16; rate=24000; channels=1``.
+
+    Returns:
+        The validated declaration.
+
+    Raises:
+        pydantic.ValidationError: The declaration is not ``audio/l16``, is
+            missing a parameter, or carries one of the wrong type or value.
+    """
+    segments = [segment.strip() for segment in mime_type.split(";")]
+    mapping: dict[str, str] = {"media_type": segments[0]} if segments else {}
+    for segment in segments[1:]:
+        key, separator, value = segment.partition("=")
+        if separator:
+            mapping[key.strip()] = value.strip()
+    return _AudioMime.model_validate(mapping)
+
+
+class SynthesizedAudio(BaseModel):
+    """The validated PCM a TTS call returned (R1.3).
+
+    The **only** place the raw audio payload is read. ``mime_type`` is parsed
+    into ``sample_rate`` and ``channels``; ``duration_seconds`` is derived from
+    the byte length; and ``data`` is proven non-empty and a whole number of
+    frames. Downstream code therefore never re-parses the wire format, and a
+    malformed payload is refused here rather than encoded into a misleading
+    note.
+
+    Note:
+        ``sample_rate``, ``channels`` and ``duration_seconds`` are derived in
+        the validator from ``data`` and ``mime_type``. The defaulted field
+        declarations exist so the constructor reads
+        ``SynthesizedAudio(data=..., mime_type=...)`` - no caller computes them.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: Raw little-endian `s16le` PCM: non-empty, and a whole number of frames.
+    data: Annotated[bytes, Field(min_length=1), AfterValidator(_require_even_length)]
+    #: The wire declaration, kept for traceability.
+    mime_type: str = Field(min_length=1)
+    #: Parsed from the declaration's rate, in hertz.
+    sample_rate: int = 0
+    #: Parsed from the declaration's channels; always 1.
+    channels: int = 0
+    #: Playback length, derived from the byte count and the parsed rate.
+    duration_seconds: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_wire(cls, values: Any) -> Any:
+        """Derive the parsed fields from `mime_type` before field validation.
+
+        A missing or wrongly-typed ``mime_type``/``data`` is left for field
+        validation to report, rather than raising an unrelated error here.
+        """
+        if not isinstance(values, dict):
+            return values
+        mime_type = values.get("mime_type")
+        data = values.get("data")
+        if not isinstance(mime_type, str) or not isinstance(data, (bytes, bytearray)):
+            return values
+        mime = _parse_audio_mime(mime_type)
+        return {
+            **values,
+            "sample_rate": mime.rate,
+            "channels": mime.channels,
+            # samples = len(data) / 2; frames = samples / channels; seconds = frames / rate.
+            "duration_seconds": len(data) / (2 * mime.channels * mime.rate),
+        }
 
 
 class GeminiError(Exception):

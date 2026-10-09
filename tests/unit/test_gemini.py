@@ -42,7 +42,7 @@ import inspect
 import json
 import logging
 from contextlib import suppress
-from typing import Any
+from typing import Any, get_args
 
 import httpx
 import pytest
@@ -76,6 +76,13 @@ API_KEY = "AIzaSUPERSECRET-GEMINI-KEY-VALUE"
 RESPONSE_BODY_SENTINEL = "RAW-RESPONSE-BODY-SENTINEL-7f3a9c"
 
 PORTRAIT = b"\xff\xd8\xff\xe0" + b"portrait-bytes" + b"\xff\xd9"
+
+#: One whole MPEG frame's worth of mono `s16le` PCM at 24 kHz (576 samples,
+#: 1152 bytes), so a value type or an encoder always has a complete frame.
+PCM_AUDIO = b"\x00\x00" * 576
+
+#: The exact declaration the verified TTS model returns, parameters and all.
+AUDIO_MIME = "audio/l16; rate=24000; channels=1"
 
 
 class Verdict(BaseModel):
@@ -329,14 +336,104 @@ async def test_gemini_request_refuses_an_unknown_image_mime_type() -> None:
 async def test_gemini_request_rejects_an_unknown_stage() -> None:
     with pytest.raises(ValidationError):
         GeminiRequest(
-            stage="narrator",  # type: ignore[arg-type]
+            stage="converter",  # type: ignore[arg-type]
             system_instruction="Speak it.",
-            prompt="Read this aloud.",
+            prompt="Render this aloud.",
         )
 
 
-def test_the_stage_enum_has_exactly_the_three_stages_of_this_phase() -> None:
-    assert [stage.value for stage in Stage] == ["bouncer", "interviewer", "scripter"]
+def test_the_stage_enum_has_exactly_the_stages_of_this_feature() -> None:
+    assert [stage.value for stage in Stage] == ["bouncer", "interviewer", "scripter", "narrator"]
+
+
+# ==========================================================================
+# R1.1 - R1.3: the TTS value types.
+# ==========================================================================
+
+
+def test_the_stage_enum_includes_the_narrator_stage() -> None:
+    """R1.1: the narrator call is staged like every other Gemini call."""
+    assert Stage.NARRATOR.value == "narrator"
+
+
+def test_voice_name_is_exactly_the_three_verified_voices() -> None:
+    """D2: a closed set, so a typo is a `mypy` failure, not a runtime surprise."""
+    assert get_args(gemini.VoiceName) == ("Kore", "Fenrir", "Charon")
+
+
+@pytest.mark.parametrize("voice", ["Kore", "Fenrir", "Charon"])
+def test_synthesis_request_accepts_every_verified_voice(voice: str) -> None:
+    """D2: the three voices verified in this repository, and no others."""
+    request = gemini.SynthesisRequest(text="Read this aloud.", voice=voice)
+
+    assert request.voice == voice
+    assert request.text == "Read this aloud."
+
+
+def test_synthesis_request_is_frozen() -> None:
+    """A request that mutated in flight would change what was asked for."""
+    request = gemini.SynthesisRequest(text="Read this aloud.", voice="Kore")
+
+    with pytest.raises(ValidationError):
+        request.text = "something else"  # type: ignore[misc]
+
+
+def test_synthesis_request_forbids_an_extra_field() -> None:
+    """R1.2: `GeminiRequest.system_instruction` cannot be smuggled in."""
+    with pytest.raises(ValidationError):
+        gemini.SynthesisRequest(
+            text="Read this aloud.",
+            voice="Kore",
+            system_instruction="You are the Narrator.",  # type: ignore[call-arg]
+        )
+
+
+def test_synthesis_request_rejects_blank_text() -> None:
+    """R1.2: `min_length=1`; there is nothing to read aloud."""
+    with pytest.raises(ValidationError):
+        gemini.SynthesisRequest(text="", voice="Kore")
+
+
+def test_synthesis_request_rejects_an_unknown_voice() -> None:
+    with pytest.raises(ValidationError):
+        gemini.SynthesisRequest(text="Read this aloud.", voice="Scarlett")
+
+
+def test_synthesized_audio_parses_the_real_mime_declaration() -> None:
+    """R1.3: `;` then `=` split, no regex; sample_rate/channels/duration derived."""
+    audio = gemini.SynthesizedAudio(data=PCM_AUDIO, mime_type=AUDIO_MIME)
+
+    assert audio.data == PCM_AUDIO
+    assert audio.sample_rate == 24_000
+    assert audio.channels == 1
+    # 1152 bytes / (2 bytes per s16le frame) / 24000 frames per second.
+    assert audio.duration_seconds == pytest.approx(576 / 24_000)
+
+
+def test_synthesized_audio_is_frozen() -> None:
+    """The wire format is parsed once; nothing downstream may re-derive it."""
+    audio = gemini.SynthesizedAudio(data=PCM_AUDIO, mime_type=AUDIO_MIME)
+
+    with pytest.raises(ValidationError):
+        audio.sample_rate = 48_000  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "data"),
+    [
+        ("audio/l16; rate=fast; channels=1", PCM_AUDIO),
+        ("audio/l16; rate=24000; channels=1", b""),
+        ("audio/l16; rate=24000; channels=1", PCM_AUDIO + b"\x00"),
+        ("audio/mpeg", PCM_AUDIO),
+        ("audio/l16; rate=24000; channels=2", PCM_AUDIO),
+        ("audio/l16; channels=1", PCM_AUDIO),
+    ],
+    ids=["rate_not_int", "empty_data", "odd_length", "not_l16", "stereo", "missing_rate"],
+)
+def test_synthesized_audio_rejects_a_malformed_payload(mime_type: str, data: bytes) -> None:
+    """R1.3: every wire-format defect is a `ValidationError`, never a coercion."""
+    with pytest.raises(ValidationError):
+        gemini.SynthesizedAudio(data=data, mime_type=mime_type)
 
 
 # ==========================================================================

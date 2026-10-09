@@ -289,7 +289,7 @@ class ConversationPipeline:
             if current.phase is state.Phase.AWAITING_PHOTO:
                 return self._out_of_order(update, current)
             if current.phase is state.Phase.SCRIPTED:
-                return SCRIPTED_NUDGE
+                return self._scripted_nudge(update, current)
             return await self._record_answer(update, current)
 
         if isinstance(update.attachment, PhotoAttachment):
@@ -317,6 +317,26 @@ class ConversationPipeline:
             },
         )
         return PHOTO_REQUEST
+
+    def _scripted_nudge(
+        self, update: InboundUpdate, current: state.SessionState
+    ) -> str:
+        """Text while a story is on screen: nudge towards a new photo.
+
+        Logged like every other row (TG4): a reply without a record would be a
+        cell no test could ever prove ran.
+        """
+        logger.info(
+            "scripted_nudge",
+            extra={
+                "event": "scripted_nudge",
+                "chat_id": update.chat_id,
+                "update_id": update.update_id,
+                "phase": current.phase.value,
+                "payload": "text",
+            },
+        )
+        return SCRIPTED_NUDGE
 
     def _unsupported(
         self,

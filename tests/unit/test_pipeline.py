@@ -37,7 +37,7 @@ from conftest import (
 from telegram import Bot, Update
 
 from telegram_documentaries.bouncer import BouncerVerdict, Verdict
-from telegram_documentaries.contracts import InboundUpdate, Reply, VoiceNote
+from telegram_documentaries.contracts import InboundUpdate, MediaKind, Reply, VoiceNote
 from telegram_documentaries.gemini import (
     GeminiThrottledError,
     GeminiUnavailableError,
@@ -47,9 +47,14 @@ from telegram_documentaries.gemini import (
 from telegram_documentaries.interviewer import InterviewPlan, Question
 from telegram_documentaries.media import MediaStore
 from telegram_documentaries.pipeline import (
+    CARRY_ON,
     GENERIC_FAILURE,
     PHOTO_MIME_TYPE,
+    PHOTO_REQUEST,
     RATE_LIMITED,
+    SCRIPTED_NUDGE,
+    UNSUPPORTED_AWAITING_PHOTO,
+    UNSUPPORTED_SCRIPTED,
     WELCOME,
     ConversationPipeline,
 )
@@ -1161,6 +1166,116 @@ async def test_media_directories_are_per_chat(tmp_path: Path) -> None:
     assert h.media.session_dir(CHAT) != h.media.session_dir(OTHER_CHAT)
     assert h.media.session_dir(CHAT).is_dir()
     assert h.media.session_dir(OTHER_CHAT).is_dir()
+
+
+# --------------------------------------------------------------------------
+# TG4 - the matrix: every phase x every payload arm, answered *and* logged
+# --------------------------------------------------------------------------
+
+
+#: Built from the enum members themselves, so a `Phase` added to the state
+#: machine lands in these tuples and fails loudly here until its cell is
+#: defined - the matrix cannot shrink silently (TG4).
+_INTERACTIVE_PHASES = tuple(Phase)
+
+#: The three arms of the inbound union: a text, a photo, or anything else.
+_MATRIX_ARMS = ("text", "photo", "unsupported")
+
+#: Every media kind the real parser can produce, so the "unsupported" arm is
+#: exercised for each rather than once (TG4).
+UNSUPPORTED_KINDS = ("sticker", "document", "voice")
+
+
+def _expected_outcome(phase: Phase, arm: str) -> tuple[str, str]:
+    """The defined (reply, log event) for a cell - the table's contract.
+
+    For the unsupported arm the reply keeps a ``{kind}`` placeholder that the
+    caller formats with the media kind that actually arrived.
+    """
+    if arm == "text":
+        if phase is Phase.AWAITING_PHOTO:
+            return PHOTO_REQUEST, "out_of_order_input"
+        if phase is Phase.AWAITING_ANSWER:
+            return "Question 1?", "answer_recorded"
+        return SCRIPTED_NUDGE, "scripted_nudge"
+    if arm == "photo":
+        return "Question 0?", "question_asked"
+    if phase is Phase.AWAITING_PHOTO:
+        return UNSUPPORTED_AWAITING_PHOTO.format(kind="{kind}"), "unsupported_media"
+    if phase is Phase.AWAITING_ANSWER:
+        return CARRY_ON.format(kind="{kind}"), "unsupported_media"
+    return UNSUPPORTED_SCRIPTED.format(kind="{kind}"), "unsupported_media"
+
+
+async def _drive_to_phase(h: Harness, phase: Phase) -> None:
+    """Move one fresh chat into `phase`, consuming exactly what that needs."""
+    if phase is Phase.AWAITING_PHOTO:
+        return
+    if phase is Phase.AWAITING_ANSWER:
+        h.client.replies = [_verdict(), PLAN_5]
+        await h.send(inbound(_photo_message()))
+    else:  # SCRIPTED: the completing answer pops the script slot.
+        h.client.replies = [_verdict(), PLAN_5, SCRIPT]
+        await h.send(inbound(_photo_message()))
+        for n in range(5):
+            await h.send(inbound(_text_message(f"Answer {n}.")))
+    assert h.phase() is phase
+
+
+def _saw_event(app_records: LogRecorder, event: str) -> bool:
+    return any(
+        app_records.extra_of(record).get("event") == event
+        for record in app_records.records
+    )
+
+
+def test_the_matrix_is_built_from_the_enum_members() -> None:
+    """TG4: a new Phase or a new payload arm lands *in* the matrix.
+
+    A Phase that is added to `state.Phase` without a defined cell makes both
+    this guard and the parametrized cells fail; an arm added to the inbound
+    union's handling must be named here or the set guard fails. A media kind
+    the parser can produce must be exercised by the unsupported arm.
+    """
+    assert tuple(Phase) == _INTERACTIVE_PHASES
+    assert set(_MATRIX_ARMS) == {"text", "photo", "unsupported"}
+    assert set(UNSUPPORTED_KINDS) <= {member.value for member in MediaKind}
+
+
+@pytest.mark.parametrize("phase", _INTERACTIVE_PHASES, ids=lambda p: p.value)
+@pytest.mark.parametrize("arm", _MATRIX_ARMS)
+async def test_every_matrix_cell_answers_and_logs(
+    tmp_path: Path,
+    app_records: LogRecorder,
+    phase: Phase,
+    arm: str,
+) -> None:
+    """All nine cells: the reply the table promises and the log that proves
+    the row ran - a cell that silently does nothing cannot pass (TG4).
+    """
+    h = _harness(tmp_path, [])
+    await _drive_to_phase(h, phase)
+
+    expected_reply, expected_event = _expected_outcome(phase, arm)
+    kinds: tuple[str, ...] = UNSUPPORTED_KINDS if arm == "unsupported" else ("",)
+
+    for kind in kinds:
+        if arm == "text":
+            reply = await h.send(inbound(_text_message("A word.")))
+        elif arm == "photo":
+            h.client.replies = [_verdict(), PLAN_5]
+            reply = await h.send(inbound(_photo_message()))
+        else:
+            reply = await h.send(inbound(_kind_message(kind)))
+
+        want = (
+            expected_reply.format(kind=kind) if arm == "unsupported" else expected_reply
+        )
+        assert reply == want, f"{phase.value} x {arm} (kind={kind})"
+        assert _saw_event(app_records, expected_event), (
+            f"{phase.value} x {arm} (kind={kind}) produced no "
+            f"{expected_event!r} record"
+        )
 
 
 # --------------------------------------------------------------------------

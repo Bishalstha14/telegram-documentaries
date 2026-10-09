@@ -39,6 +39,7 @@ from telegram import Bot, Update
 from telegram_documentaries.bouncer import BouncerVerdict, Verdict
 from telegram_documentaries.contracts import InboundUpdate, Reply, VoiceNote
 from telegram_documentaries.gemini import (
+    GeminiThrottledError,
     GeminiUnavailableError,
     Stage,
     SynthesizedAudio,
@@ -48,6 +49,7 @@ from telegram_documentaries.media import MediaStore
 from telegram_documentaries.pipeline import (
     GENERIC_FAILURE,
     PHOTO_MIME_TYPE,
+    RATE_LIMITED,
     WELCOME,
     ConversationPipeline,
 )
@@ -812,6 +814,16 @@ def _unavailable(stage: Stage, reason: str) -> GeminiUnavailableError:
     )
 
 
+def _throttled(stage: Stage) -> GeminiThrottledError:
+    """A 429 as the transport would have produced it after the retries ran out."""
+    return GeminiThrottledError(
+        stage=stage,
+        reason="the API throttled the request",
+        error_type="APIError",
+        error_code=429,
+    )
+
+
 async def test_a_gemini_failure_on_the_final_answer_preserves_the_state(
     tmp_path: Path,
 ) -> None:
@@ -908,6 +920,96 @@ async def test_a_gemini_timeout_never_escapes_into_the_adapter(tmp_path: Path) -
         h2.client.replies = []
         reply2 = await h2.send(inbound(_text_message("Answer.")))
         assert isinstance(reply2, str) and reply2, stage
+
+
+async def test_a_throttled_step_replies_with_the_rate_limited_line(
+    tmp_path: Path,
+) -> None:
+    """R1.6: a throttle is answered with 'try again', not the generic line."""
+    h = _harness(tmp_path, [_throttled(Stage.BOUNCER)])
+
+    reply = await h.send(inbound(_photo_message()))
+
+    assert reply == RATE_LIMITED
+    assert reply != GENERIC_FAILURE
+
+
+def test_the_rate_limited_line_never_tells_the_user_to_restart() -> None:
+    """R1.6: the advice for a transient throttle is to resend, not to reset.
+
+    `/restart` would throw away a half-finished interview for a condition that
+    lasts a second - the exact failure this phase exists to remove.
+    """
+    assert "/restart" not in RATE_LIMITED
+
+
+async def test_a_throttle_holds_the_session_so_the_resend_answers_the_same_question(
+    tmp_path: Path,
+) -> None:
+    """R1.7: 'try again' must be true - the pending question is untouched."""
+    h = _harness(tmp_path, [_verdict(), PLAN_5])
+    await h.send(inbound(_photo_message()))
+    for n in range(4):
+        await h.send(inbound(_text_message(f"Answer {n}.")))
+
+    h.client.error = _throttled(Stage.SCRIPTER)
+    h.client.replies = []
+    reply = await h.send(inbound(_text_message("Answer 4.")))
+
+    assert reply == RATE_LIMITED
+    assert h.state().pending_question == "Question 4?"
+    assert len(h.state().answers) == 4
+
+    # The throttle clears; the resend is consumed as the answer to the question
+    # that was already on screen - nothing was skipped, nothing was lost.
+    h.client.error = None
+    h.client.replies = [SCRIPT]
+    reply2 = await h.send(inbound(_text_message("Answer 4, second try.")))
+    assert isinstance(reply2, VoiceNote)
+    assert h.phase() is Phase.SCRIPTED
+
+
+async def test_a_throttled_synthesis_still_degrades_to_the_narration_text(
+    tmp_path: Path,
+) -> None:
+    """R1.8: a throttled *delivery* keeps the D6 path - the user gets the text.
+
+    Only a failed *step* earns the RATE_LIMITED line; a failed delivery of an
+    already-written narration degrades to the narration itself.
+    """
+    h = _harness(tmp_path, [_verdict(), PLAN_5])
+    await h.send(inbound(_photo_message()))
+    for n in range(4):
+        await h.send(inbound(_text_message(f"Answer {n}.")))
+
+    # The narration itself writes fine (D6 is a *delivery* fallback); only the
+    # synthesis call that voices it is throttled. The final answer completes
+    # the plan, triggering narration with the throttle on the synth seam.
+    h.client.replies = [SCRIPT]
+    h.client.synth_error = _throttled(Stage.NARRATOR)
+    reply = await h.send(inbound(_text_message("Answer 4.")))
+
+    assert reply == SCRIPT.text
+    assert isinstance(reply, str)
+    assert h.phase() is Phase.SCRIPTED
+
+
+async def test_a_throttle_is_logged_with_the_rate_limited_record(
+    tmp_path: Path,
+    app_records: LogRecorder,
+) -> None:
+    """R1.9: the hub's answer is stamped with the chat and the update."""
+    h = _harness(tmp_path, [_throttled(Stage.BOUNCER)])
+    await h.send(inbound(_photo_message()))
+
+    records = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "rate_limited"
+    ]
+    assert records, "a throttle must be answered *and* logged, never silently"
+    assert records[0]["chat_id"] == CHAT
+    assert records[0]["update_id"] == UPDATE
 
 
 async def test_a_failed_photo_fetch_is_answered_not_raised(tmp_path: Path) -> None:

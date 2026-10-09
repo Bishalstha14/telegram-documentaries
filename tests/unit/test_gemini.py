@@ -1615,6 +1615,85 @@ async def test_synthesize_asks_for_text_and_audio_without_a_schema() -> None:
     assert voice_config.prebuilt_voice_config.voice_name == "Fenrir"
 
 
+# ==========================================================================
+# R1.5 - one budget per call *class*, not one budget for the whole process.
+# ==========================================================================
+#
+# Regression lock for a live-verified defect. The first version of this module
+# applied a single ``GEMINI_TIMEOUT_MS`` (20 s) to the client, and the client is
+# shared by all four stages. That ceiling was chosen when the slowest call was
+# the Scripter at ~1.2 s. Synthesis is a fundamentally longer call: it generates
+# ~40 s of audio and measured 18-20 s live, so the shared 20 s bound timed out
+# on roughly half of all voice-note runs:
+#
+#   gemini_call_failed | stage=narrator error_type=ReadTimeout
+#     model=gemini-3.1-flash-tts-preview update_id=75407294
+#   event=gemini_call duration_ms=20010.806 stage=narrator
+#   narration_voice_failed | reason=synthesis error_type=GeminiUnavailableError
+#
+# The fix is a distinct, longer synthesis budget carried on the request config
+# itself (``GenerateContentConfig.http_options``), which the SDK verified live
+# to override the client-level timeout. The short calls keep the short budget:
+# raising the global ceiling would let a hung Bouncer stall the conversation for
+# a minute. The tests below lock both halves - one budget per call class, and
+# the separation itself - so a future reader cannot "simplify" them back into
+# one without failing here.
+
+
+def test_the_synthesis_budget_is_longer_than_the_shared_text_budget() -> None:
+    """The regression guard: if the two budgets are re-merged, this fails.
+
+    TTS measured 18-20 s; the text stages measured ~1.2 s. A synthesis budget
+    that is not strictly larger than the shared text budget cannot cover the
+    call the feature exists to deliver.
+    """
+    assert gemini.TTS_TIMEOUT_MS > gemini.GEMINI_TIMEOUT_MS
+
+
+def test_the_synthesis_budget_meets_the_api_minimum_deadline() -> None:
+    """The API rejects any deadline below 10 s.
+
+    Live: ``400 INVALID_ARGUMENT: Manually set deadline 3s is too short.
+    Minimum allowed deadline is 10s.`` A budget under that floor would fail
+    every synthesis call before it was even attempted.
+    """
+    assert gemini.TTS_TIMEOUT_MS >= 10_000
+
+
+async def test_synthesis_requests_carry_their_own_longer_timeout() -> None:
+    """The per-request ``http_options`` is what overrides the client's bound.
+
+    Verified live: a TTS call with the client timeout at the API minimum of 10 s
+    and the per-call timeout at 60 s took 18.0 s and succeeded (1.75 MB, ~36.6 s
+    of audio) - only possible if the per-call value replaced the client value.
+    Without this field, synthesis falls back to the shared 20 s client ceiling
+    and flips a coin.
+    """
+    transport = FakeTransport(_audio_reply())
+
+    await _synthesize(_client(transport))
+
+    http_options = transport.calls[0].config.http_options
+    assert http_options is not None
+    assert http_options.timeout == gemini.TTS_TIMEOUT_MS
+
+
+@pytest.mark.parametrize("stage", [Stage.BOUNCER, Stage.INTERVIEWER, Stage.SCRIPTER])
+async def test_text_requests_do_not_carry_the_synthesis_timeout(stage: Stage) -> None:
+    """The short calls keep the short budget - the global ceiling is not raised.
+
+    A longer bound on the Bouncer, Interviewer or Scripter would let a hung call
+    stall the conversation for a minute. They carry no per-request override at
+    all, so the client-level ``GEMINI_TIMEOUT_MS`` remains in effect.
+    """
+    transport = FakeTransport(_reply(json.dumps({"verdict": "HUMAN", "subject": "a man"})))
+
+    await _client(transport).generate(_request(stage=stage), Verdict, -1, 4242)
+
+    http_options = transport.calls[0].config.http_options
+    assert http_options is None or http_options.timeout != gemini.TTS_TIMEOUT_MS
+
+
 _AUDIO_REJECTIONS = [
     pytest.param(_reply(candidates=[]), "no candidates", id="no_candidates"),
     pytest.param(_reply(candidates=[types.Candidate()]), "no content", id="no_content"),

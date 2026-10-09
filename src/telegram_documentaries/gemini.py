@@ -57,6 +57,7 @@ __all__ = [
     "GEMINI_TIMEOUT_MS",
     "MODEL_ID",
     "TTS_MODEL_ID",
+    "TTS_TIMEOUT_MS",
     "GeminiClient",
     "GeminiError",
     "GeminiRequest",
@@ -83,9 +84,31 @@ MODEL_ID = "gemini-3.1-flash-lite"
 #: returns HTTP 400 - so it is named once here rather than inline at the call.
 TTS_MODEL_ID = "gemini-3.1-flash-tts-preview"
 
-#: R1.5: every call is bounded at 20 seconds through `types.HttpOptions`, never
-#: at the SDK's own default, which is far longer than a user will wait.
+#: R1.5: the short text calls - Bouncer, Interviewer and Scripter - are bounded
+#: at 20 seconds through the client-level `types.HttpOptions`, never at the SDK's
+#: own default, which is far longer than a user will wait. This is the *shared*
+#: budget for those calls; it is deliberately not raised to cover synthesis (see
+#: :data:`TTS_TIMEOUT_MS`), because a hung Bouncer must not stall a conversation.
 GEMINI_TIMEOUT_MS = 20_000
+
+#: R1.5: speech synthesis gets its own, longer budget, applied per request on
+#: the synthesis config (`GenerateContentConfig.http_options`) so it overrides
+#: the client-level bound above.
+#:
+#: Why the two budgets differ - do not merge them back into one. The 20 s figure
+#: was chosen when the slowest call was the Scripter at ~1.2 s. Synthesis is a
+#: fundamentally longer call: it generates ~40 s of audio and measured 18-20 s
+#: live. Sharing the 20 s ceiling made every voice note a coin flip, and a
+#: timeout here loses the voice note the feature exists to deliver. Live log:
+#:
+#:     gemini_call_failed | stage=narrator error_type=ReadTimeout
+#:       model=gemini-3.1-flash-tts-preview update_id=75407294
+#:     event=gemini_call duration_ms=20010.806 stage=narrator
+#:
+#: 60 s clears the measured worst case with wide margin while still bounding the
+#: call. The Gemini API rejects any deadline below 10 s, so this is well clear of
+#: the floor; it is kept at or above that floor by a test.
+TTS_TIMEOUT_MS = 60_000
 
 #: R1.3: replies are asked for as JSON against a schema, never as prose to be
 #: parsed by hand.
@@ -618,13 +641,18 @@ class GenAiGeminiClient:
     """The production :class:`GeminiClient`, over `google.genai` (R1.2).
 
     The only importer of `google.genai` in the project. It owns one `genai.Client`
-    for the process lifetime and one 20-second timeout.
+    for the process lifetime. The client-level timeout is the shared 20-second
+    budget for the short text calls; synthesis overrides it per request with the
+    longer :data:`TTS_TIMEOUT_MS`, because it measured 18-20 s live and would
+    otherwise flip a coin against 20 s (see `_synthesis_config`).
 
     Args:
         api_key: The Gemini key, already validated as non-blank by `Settings`. It
             is handed straight to the SDK and then dropped: this object keeps no
             reference to it, so no `repr`, log record or traceback can carry it.
-        timeout_ms: Per-call bound in milliseconds (R1.5).
+        timeout_ms: The client-level bound in milliseconds for the short text
+            calls (R1.5). Synthesis is *not* bounded by this value - it carries
+            :data:`TTS_TIMEOUT_MS` on its own request config.
         transport: Substitutes the HTTP call. Production leaves it unset, which
             builds the real `genai.Client`; a test passes a fake so the network
             seam is the only thing mocked (R10).
@@ -797,6 +825,14 @@ def _synthesis_config(request: SynthesisRequest) -> types.GenerateContentConfig:
     400 ``INVALID_ARGUMENT``, so the model's own ``audio/l16`` is the only
     working format; and audio is not JSON, so :func:`_typed_reply` is not on this
     path and :class:`SynthesizedAudio`'s own validation is (R1.3).
+
+    It **does** carry its own ``http_options`` with :data:`TTS_TIMEOUT_MS`, and
+    that is load-bearing: the client-level :data:`GEMINI_TIMEOUT_MS` is the
+    shared 20 s budget for the short text calls, and synthesis measured 18-20 s
+    live. The per-request field genuinely overrides the client value (verified
+    against the live API), so a synthesis call gets the longer budget without
+    raising the ceiling for a Bouncer that might hang. See :data:`TTS_TIMEOUT_MS`
+    for the measurement and why the two must not be merged.
     """
     return types.GenerateContentConfig(
         response_modalities=["TEXT", "AUDIO"],
@@ -805,6 +841,7 @@ def _synthesis_config(request: SynthesisRequest) -> types.GenerateContentConfig:
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=request.voice)
             )
         ),
+        http_options=types.HttpOptions(timeout=TTS_TIMEOUT_MS),
     )
 
 

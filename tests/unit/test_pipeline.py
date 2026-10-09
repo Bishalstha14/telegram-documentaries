@@ -37,8 +37,9 @@ from conftest import (
 from telegram import Bot, Update
 
 from telegram_documentaries.bouncer import BouncerVerdict, Verdict
-from telegram_documentaries.contracts import InboundUpdate, Reply, VoiceNote
+from telegram_documentaries.contracts import InboundUpdate, MediaKind, Reply, VoiceNote
 from telegram_documentaries.gemini import (
+    GeminiThrottledError,
     GeminiUnavailableError,
     Stage,
     SynthesizedAudio,
@@ -46,8 +47,14 @@ from telegram_documentaries.gemini import (
 from telegram_documentaries.interviewer import InterviewPlan, Question
 from telegram_documentaries.media import MediaStore
 from telegram_documentaries.pipeline import (
+    CARRY_ON,
     GENERIC_FAILURE,
     PHOTO_MIME_TYPE,
+    PHOTO_REQUEST,
+    RATE_LIMITED,
+    SCRIPTED_NUDGE,
+    UNSUPPORTED_AWAITING_PHOTO,
+    UNSUPPORTED_SCRIPTED,
     WELCOME,
     ConversationPipeline,
 )
@@ -812,6 +819,16 @@ def _unavailable(stage: Stage, reason: str) -> GeminiUnavailableError:
     )
 
 
+def _throttled(stage: Stage) -> GeminiThrottledError:
+    """A 429 as the transport would have produced it after the retries ran out."""
+    return GeminiThrottledError(
+        stage=stage,
+        reason="the API throttled the request",
+        error_type="APIError",
+        error_code=429,
+    )
+
+
 async def test_a_gemini_failure_on_the_final_answer_preserves_the_state(
     tmp_path: Path,
 ) -> None:
@@ -908,6 +925,96 @@ async def test_a_gemini_timeout_never_escapes_into_the_adapter(tmp_path: Path) -
         h2.client.replies = []
         reply2 = await h2.send(inbound(_text_message("Answer.")))
         assert isinstance(reply2, str) and reply2, stage
+
+
+async def test_a_throttled_step_replies_with_the_rate_limited_line(
+    tmp_path: Path,
+) -> None:
+    """R1.6: a throttle is answered with 'try again', not the generic line."""
+    h = _harness(tmp_path, [_throttled(Stage.BOUNCER)])
+
+    reply = await h.send(inbound(_photo_message()))
+
+    assert reply == RATE_LIMITED
+    assert reply != GENERIC_FAILURE
+
+
+def test_the_rate_limited_line_never_tells_the_user_to_restart() -> None:
+    """R1.6: the advice for a transient throttle is to resend, not to reset.
+
+    `/restart` would throw away a half-finished interview for a condition that
+    lasts a second - the exact failure this phase exists to remove.
+    """
+    assert "/restart" not in RATE_LIMITED
+
+
+async def test_a_throttle_holds_the_session_so_the_resend_answers_the_same_question(
+    tmp_path: Path,
+) -> None:
+    """R1.7: 'try again' must be true - the pending question is untouched."""
+    h = _harness(tmp_path, [_verdict(), PLAN_5])
+    await h.send(inbound(_photo_message()))
+    for n in range(4):
+        await h.send(inbound(_text_message(f"Answer {n}.")))
+
+    h.client.error = _throttled(Stage.SCRIPTER)
+    h.client.replies = []
+    reply = await h.send(inbound(_text_message("Answer 4.")))
+
+    assert reply == RATE_LIMITED
+    assert h.state().pending_question == "Question 4?"
+    assert len(h.state().answers) == 4
+
+    # The throttle clears; the resend is consumed as the answer to the question
+    # that was already on screen - nothing was skipped, nothing was lost.
+    h.client.error = None
+    h.client.replies = [SCRIPT]
+    reply2 = await h.send(inbound(_text_message("Answer 4, second try.")))
+    assert isinstance(reply2, VoiceNote)
+    assert h.phase() is Phase.SCRIPTED
+
+
+async def test_a_throttled_synthesis_still_degrades_to_the_narration_text(
+    tmp_path: Path,
+) -> None:
+    """R1.8: a throttled *delivery* keeps the D6 path - the user gets the text.
+
+    Only a failed *step* earns the RATE_LIMITED line; a failed delivery of an
+    already-written narration degrades to the narration itself.
+    """
+    h = _harness(tmp_path, [_verdict(), PLAN_5])
+    await h.send(inbound(_photo_message()))
+    for n in range(4):
+        await h.send(inbound(_text_message(f"Answer {n}.")))
+
+    # The narration itself writes fine (D6 is a *delivery* fallback); only the
+    # synthesis call that voices it is throttled. The final answer completes
+    # the plan, triggering narration with the throttle on the synth seam.
+    h.client.replies = [SCRIPT]
+    h.client.synth_error = _throttled(Stage.NARRATOR)
+    reply = await h.send(inbound(_text_message("Answer 4.")))
+
+    assert reply == SCRIPT.text
+    assert isinstance(reply, str)
+    assert h.phase() is Phase.SCRIPTED
+
+
+async def test_a_throttle_is_logged_with_the_rate_limited_record(
+    tmp_path: Path,
+    app_records: LogRecorder,
+) -> None:
+    """R1.9: the hub's answer is stamped with the chat and the update."""
+    h = _harness(tmp_path, [_throttled(Stage.BOUNCER)])
+    await h.send(inbound(_photo_message()))
+
+    records = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "rate_limited"
+    ]
+    assert records, "a throttle must be answered *and* logged, never silently"
+    assert records[0]["chat_id"] == CHAT
+    assert records[0]["update_id"] == UPDATE
 
 
 async def test_a_failed_photo_fetch_is_answered_not_raised(tmp_path: Path) -> None:
@@ -1059,6 +1166,116 @@ async def test_media_directories_are_per_chat(tmp_path: Path) -> None:
     assert h.media.session_dir(CHAT) != h.media.session_dir(OTHER_CHAT)
     assert h.media.session_dir(CHAT).is_dir()
     assert h.media.session_dir(OTHER_CHAT).is_dir()
+
+
+# --------------------------------------------------------------------------
+# TG4 - the matrix: every phase x every payload arm, answered *and* logged
+# --------------------------------------------------------------------------
+
+
+#: Built from the enum members themselves, so a `Phase` added to the state
+#: machine lands in these tuples and fails loudly here until its cell is
+#: defined - the matrix cannot shrink silently (TG4).
+_INTERACTIVE_PHASES = tuple(Phase)
+
+#: The three arms of the inbound union: a text, a photo, or anything else.
+_MATRIX_ARMS = ("text", "photo", "unsupported")
+
+#: Every media kind the real parser can produce, so the "unsupported" arm is
+#: exercised for each rather than once (TG4).
+UNSUPPORTED_KINDS = ("sticker", "document", "voice")
+
+
+def _expected_outcome(phase: Phase, arm: str) -> tuple[str, str]:
+    """The defined (reply, log event) for a cell - the table's contract.
+
+    For the unsupported arm the reply keeps a ``{kind}`` placeholder that the
+    caller formats with the media kind that actually arrived.
+    """
+    if arm == "text":
+        if phase is Phase.AWAITING_PHOTO:
+            return PHOTO_REQUEST, "out_of_order_input"
+        if phase is Phase.AWAITING_ANSWER:
+            return "Question 1?", "answer_recorded"
+        return SCRIPTED_NUDGE, "scripted_nudge"
+    if arm == "photo":
+        return "Question 0?", "question_asked"
+    if phase is Phase.AWAITING_PHOTO:
+        return UNSUPPORTED_AWAITING_PHOTO.format(kind="{kind}"), "unsupported_media"
+    if phase is Phase.AWAITING_ANSWER:
+        return CARRY_ON.format(kind="{kind}"), "unsupported_media"
+    return UNSUPPORTED_SCRIPTED.format(kind="{kind}"), "unsupported_media"
+
+
+async def _drive_to_phase(h: Harness, phase: Phase) -> None:
+    """Move one fresh chat into `phase`, consuming exactly what that needs."""
+    if phase is Phase.AWAITING_PHOTO:
+        return
+    if phase is Phase.AWAITING_ANSWER:
+        h.client.replies = [_verdict(), PLAN_5]
+        await h.send(inbound(_photo_message()))
+    else:  # SCRIPTED: the completing answer pops the script slot.
+        h.client.replies = [_verdict(), PLAN_5, SCRIPT]
+        await h.send(inbound(_photo_message()))
+        for n in range(5):
+            await h.send(inbound(_text_message(f"Answer {n}.")))
+    assert h.phase() is phase
+
+
+def _saw_event(app_records: LogRecorder, event: str) -> bool:
+    return any(
+        app_records.extra_of(record).get("event") == event
+        for record in app_records.records
+    )
+
+
+def test_the_matrix_is_built_from_the_enum_members() -> None:
+    """TG4: a new Phase or a new payload arm lands *in* the matrix.
+
+    A Phase that is added to `state.Phase` without a defined cell makes both
+    this guard and the parametrized cells fail; an arm added to the inbound
+    union's handling must be named here or the set guard fails. A media kind
+    the parser can produce must be exercised by the unsupported arm.
+    """
+    assert tuple(Phase) == _INTERACTIVE_PHASES
+    assert set(_MATRIX_ARMS) == {"text", "photo", "unsupported"}
+    assert set(UNSUPPORTED_KINDS) <= {member.value for member in MediaKind}
+
+
+@pytest.mark.parametrize("phase", _INTERACTIVE_PHASES, ids=lambda p: p.value)
+@pytest.mark.parametrize("arm", _MATRIX_ARMS)
+async def test_every_matrix_cell_answers_and_logs(
+    tmp_path: Path,
+    app_records: LogRecorder,
+    phase: Phase,
+    arm: str,
+) -> None:
+    """All nine cells: the reply the table promises and the log that proves
+    the row ran - a cell that silently does nothing cannot pass (TG4).
+    """
+    h = _harness(tmp_path, [])
+    await _drive_to_phase(h, phase)
+
+    expected_reply, expected_event = _expected_outcome(phase, arm)
+    kinds: tuple[str, ...] = UNSUPPORTED_KINDS if arm == "unsupported" else ("",)
+
+    for kind in kinds:
+        if arm == "text":
+            reply = await h.send(inbound(_text_message("A word.")))
+        elif arm == "photo":
+            h.client.replies = [_verdict(), PLAN_5]
+            reply = await h.send(inbound(_photo_message()))
+        else:
+            reply = await h.send(inbound(_kind_message(kind)))
+
+        want = (
+            expected_reply.format(kind=kind) if arm == "unsupported" else expected_reply
+        )
+        assert reply == want, f"{phase.value} x {arm} (kind={kind})"
+        assert _saw_event(app_records, expected_event), (
+            f"{phase.value} x {arm} (kind={kind}) produced no "
+            f"{expected_event!r} record"
+        )
 
 
 # --------------------------------------------------------------------------

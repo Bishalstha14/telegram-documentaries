@@ -48,6 +48,7 @@ from telegram_documentaries.contracts import (
 from telegram_documentaries.gemini import (
     GeminiClient,
     GeminiError,
+    GeminiThrottledError,
 )
 from telegram_documentaries.narrator import NarratorError
 from telegram_documentaries.observability import get_logger
@@ -104,6 +105,13 @@ SCRIPT_FAILED = (
 
 GENERIC_FAILURE = (
     "Something went wrong on my side. Send /restart to begin again."
+)
+
+#: R1.6: the one failure worth a second try. A throttle is transient and the
+#: retry that was just spent is cheap, so the honest advice is "resend" - the
+#: session is still held (R1.7), never the /restart that would throw it away.
+RATE_LIMITED = (
+    "I am a bit overwhelmed right now - give me a moment and send that again."
 )
 
 CARRY_ON = (
@@ -236,6 +244,25 @@ class ConversationPipeline:
                 },
             )
             return SCRIPT_FAILED
+        except GeminiThrottledError as exc:
+            # R1.6: a throttle that outlived its retries gets its own, honest
+            # line. Unlike GENERIC_FAILURE it never points at /restart: the
+            # session is held (R1.7), so the resend is consumed as the answer
+            # to the question already on screen. `logger.exception` so the same
+            # "no silent failure" rule holds - this is still a failure, just a
+            # recoverable one.
+            logger.exception(
+                "rate_limited",
+                extra={
+                    "event": "rate_limited",
+                    "chat_id": chat_id,
+                    "update_id": update_id,
+                    "stage": getattr(getattr(exc, "stage", None), "value", None),
+                    "error_type": type(exc).__name__,
+                    "error_code": getattr(exc, "error_code", None),
+                },
+            )
+            return RATE_LIMITED
         except (GeminiError, state.SessionError, media.MediaError) as exc:
             # R9.5: the boundary. Every domain failure becomes one short human
             # line, and `exc` is logged as a typed object - never rendered into
@@ -262,7 +289,7 @@ class ConversationPipeline:
             if current.phase is state.Phase.AWAITING_PHOTO:
                 return self._out_of_order(update, current)
             if current.phase is state.Phase.SCRIPTED:
-                return SCRIPTED_NUDGE
+                return self._scripted_nudge(update, current)
             return await self._record_answer(update, current)
 
         if isinstance(update.attachment, PhotoAttachment):
@@ -290,6 +317,26 @@ class ConversationPipeline:
             },
         )
         return PHOTO_REQUEST
+
+    def _scripted_nudge(
+        self, update: InboundUpdate, current: state.SessionState
+    ) -> str:
+        """Text while a story is on screen: nudge towards a new photo.
+
+        Logged like every other row (TG4): a reply without a record would be a
+        cell no test could ever prove ran.
+        """
+        logger.info(
+            "scripted_nudge",
+            extra={
+                "event": "scripted_nudge",
+                "chat_id": update.chat_id,
+                "update_id": update.update_id,
+                "phase": current.phase.value,
+                "payload": "text",
+            },
+        )
+        return SCRIPTED_NUDGE
 
     def _unsupported(
         self,

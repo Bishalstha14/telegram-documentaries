@@ -16,6 +16,8 @@ The technical contract. Every agent defers to this file.
   - Narrator — `gemini-3.1-flash-tts-preview`
 - **Validation:** Pydantic v2
 - **Config:** `pydantic-settings`, reading `.env`
+- **Audio encoding:** `lameenc` (in-process MP3; no system FFmpeg, no bundled
+  binary). See D-V3 in the voice-phase divergences.
 - **Tooling:** pytest, ruff, mypy (strict)
 - **Environment:** project-local `.venv`
 
@@ -106,6 +108,43 @@ Two guards, both verified necessary in the venv rather than assumed:
 
 Module naming: the logging module is `observability.py`, **not** `logging.py` — it
 shadows a stdlib module name inside the package.
+
+### The voice-phase divergences (D-V1–D-V4)
+
+Decided by the Narrator feature
+(`SPECS/2026-10-08-narrator-voice-note/requirements.md`). They supersede two of
+the text slice's contracts, each recorded as a divergence rather than left as a
+contradiction, and each with an in-line cross-reference at the original
+requirement (text-slice R1.2 and R9.3).
+
+| # | Divergence | Why |
+|---|---|---|
+| D-V1 | `handle_*` returns `Reply = str \| VoiceNote`, not `str` (text-slice R9.3) | A voice note is not a string. The *intent* — one reply per update — is preserved; only the type widens. |
+| D-V2 | `GeminiClient` has two methods, not one (text-slice R1.2) | TTS returns audio, not schema-bound JSON. One seam, one injected object: `generate` for structured text replies, `synthesize` for audio. |
+| D-V3 | A new third-party dependency, `lameenc` | No encoder exists in this environment; ~248 KB self-contained wheel vs ~35 MB bundled FFmpeg or a non-reproducible system binary. The chosen voice is `Kore`, one of three (`Kore`/`Fenrir`/`Charon`) verified against the live API, pinned behind a `Literal`. |
+| D-V4 | `_write_script` catches `GeminiError` where `_respond` already does | `_respond`'s mapping to `GENERIC_FAILURE` is correct for a *failed step* and wrong for a *failed delivery*; the fallback to the narration-as-text has to happen one level down. |
+
+## Timeouts and throttling
+
+Timeouts are **per call class**, not one global ceiling, and a 429 is the only
+failure the transport re-attempts.
+
+- **Text calls (Bouncer, Interviewer, Scripter): 20 s** — `GEMINI_TIMEOUT_MS`.
+- **Synthesis calls (Narrator): 60 s** — `TTS_TIMEOUT_MS`, its own
+  `http_options` on the synthesis config, not the shared ceiling. A synthesis
+  call at text latency would time out a perfectly good voice note; a text call
+  at synthesis latency would hold the chat open on a dead model.
+- **Throttle retry:** a `429` is retried at most three times total
+  (`_THROTTLE_MAX_ATTEMPTS = 3`), paced `1.0 s` then `2.0 s` through a
+  module-level `_sleep` seam so tests never wait. Throttles are cheap to retry
+  — they fail in well under a second — and only the `429` is retried; timeouts,
+  transport failures, `5xx` and unreadable replies raise on the first attempt.
+  When the bound is spent, `GeminiThrottledError` (`GeminiUnavailableError`'s
+  strict subclass) surfaces and the hub answers with `RATE_LIMITED` — a
+  "give me a moment and send that again" line that never mentions `/restart`,
+  because the session is held and the resend is consumed as the answer already
+  on screen. Timeouts and `5xx` are *not* retried, for the same reason the
+  re-attempt is bounded: a retry on a slow call holds the chat open for nothing.
 
 ## Logging & error policy
 

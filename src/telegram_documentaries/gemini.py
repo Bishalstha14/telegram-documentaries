@@ -32,6 +32,7 @@ protocol is the simplest thing that is still a real boundary.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Sequence
 from enum import StrEnum
@@ -62,6 +63,7 @@ __all__ = [
     "GeminiError",
     "GeminiRequest",
     "GeminiResponseError",
+    "GeminiThrottledError",
     "GeminiTransport",
     "GeminiUnavailableError",
     "GenAiGeminiClient",
@@ -117,6 +119,13 @@ _JSON_MIME_TYPE = "application/json"
 #: R1.6: throttling is an environmental condition, so it preserves a session
 #: just as a 5xx does, rather than being treated as our own defect.
 _THROTTLED_CODE = 429
+
+#: R1.2: bounded retry for a 429. The delay doubles: 1.0 s then 2.0 s.
+_THROTTLE_MAX_ATTEMPTS = 3
+_THROTTLE_BASE_DELAY_SECONDS = 1.0
+
+#: R1.4: sleep seam so tests never wait.
+_sleep = asyncio.sleep
 
 _SchemaT = TypeVar("_SchemaT", bound=BaseModel)
 
@@ -330,6 +339,21 @@ class GeminiUnavailableError(GeminiError):
         self.error_code = error_code
 
 
+class GeminiThrottledError(GeminiUnavailableError):
+    """The API returned ``429``: a transient throttle, not an outage (R1.1).
+
+    A **subclass** of :class:`GeminiUnavailableError`, so every existing
+    ``except GeminiUnavailableError`` / ``except GeminiError`` that keeps a
+    session for an environmental failure stays correct - including the
+    narrator's degrade-to-text path. It exists only so a caller that cares can
+    tell "we were throttled, try again shortly" apart from "the service is
+    down" and reach for different words (D4).
+
+    Inherits the assembled, leak-free message from its parent; it never carries
+    ``str(exc)`` (R1.7).
+    """
+
+
 class GeminiResponseError(GeminiError):
     """A reply arrived and was rejected under R1.4.
 
@@ -465,53 +489,87 @@ async def _call_transport(
     shared by :func:`_generate_content` and :func:`_synthesize` so the
     classification is written once. Nothing here renders ``str(exc)``; the
     leaky originals are chained with ``from None``.
+
+    The loop is the Phase 7 rate-limit fallback (R1.2): a ``429`` is the one
+    failure worth re-attempting, because it is transient *and* cheap - it fails
+    in well under a second (measured: 0.1-0.6 s on every image-model probe in
+    the feasibility pass), so the bounded backoff costs at most ~3 s and the
+    user often never learns a throttle happened. Everything else - timeouts,
+    transport failures, 5xx, unreadable replies - raises on the first attempt,
+    for the reason the scripter recorded: a retry on a slow call holds the chat
+    open for nothing (R1.3).
     """
-    try:
-        return await transport.generate_content(
-            model=model,
-            contents=contents,
-            config=config,
-        )
-    except httpx.TimeoutException as exc:
-        raise _unavailable(stage, "the request timed out", exc, chat_id, update_id) from None
-    except httpx.HTTPError as exc:
-        raise _unavailable(stage, "a transport failure", exc, chat_id, update_id) from None
-    except genai_errors.APIError as exc:
-        raise _from_api_error(stage, exc, chat_id, update_id) from None
-    except genai_errors.UnknownApiResponseError as exc:
-        # The SDK received something it could not read: a reply we cannot use,
-        # not an outage. `str(exc)` is not rendered.
-        raise _reject(
-            stage,
-            f"the SDK could not read the reply ({type(exc).__name__})",
-            chat_id=chat_id,
-            update_id=update_id,
-        ) from None
-    except Exception as exc:
-        # Final catch-all, and it has to be one: `google.genai` reads the 200
-        # body *inside* `generate_content` - `json.loads`, then its own
-        # converters, then pydantic - so a body its parser cannot turn into a
-        # `GenerateContentResponse` raises before `_typed_reply` ever sees an
-        # object. Those failures are none of the four types above: with
-        # google-genai 2.28.0 the escaping set is `ValidationError`,
-        # `JSONDecodeError`, `TypeError` and `AttributeError`, and the first
-        # carries the raw body in `str(exc)` as `input_value=...`.
-        #
-        # `_reject`, not `_unavailable`: a 200 that the gateway or the SDK
-        # cannot read is a reply we were handed and could not use - a defect at
-        # the reply end, like `UnknownApiResponseError` - rather than a network,
-        # quota or 5xx outage, so it must be the loud class and must not
-        # advertise the session as worth retrying (R1.6).
-        #
-        # Class name only, never `str(exc)`/`repr(exc)`, and `from None` so the
-        # `@logged` decorator's `exc_info` traceback cannot reach the original
-        # either (R1.7, and this function's own invariant above).
-        raise _reject(
-            stage,
-            f"the SDK could not read the reply ({type(exc).__name__})",
-            chat_id=chat_id,
-            update_id=update_id,
-        ) from None
+    attempts = 0
+    while True:
+        try:
+            return await transport.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except httpx.TimeoutException as exc:
+            raise _unavailable(stage, "the request timed out", exc, chat_id, update_id) from None
+        except httpx.HTTPError as exc:
+            raise _unavailable(stage, "a transport failure", exc, chat_id, update_id) from None
+        except genai_errors.APIError as exc:
+            code = _code_of(exc)
+            if code == _THROTTLED_CODE and attempts < _THROTTLE_MAX_ATTEMPTS - 1:
+                # One retry, logged and paced: base * 2**attempt -> 1.0 s then
+                # 2.0 s. Only the throttle is retried, and only while the bound
+                # holds; the final attempt falls through to `_from_api_error`
+                # and becomes `GeminiThrottledError` (R1.5).
+                attempts += 1
+                delay = _THROTTLE_BASE_DELAY_SECONDS * (2 ** (attempts - 1))
+                logger.warning(
+                    "gemini_throttled_retry",
+                    extra={
+                        "event": "gemini_throttled_retry",
+                        "stage": stage.value,
+                        "model": MODEL_ID,
+                        "chat_id": chat_id,
+                        "update_id": update_id,
+                        "attempt": attempts,
+                        "delay": delay,
+                        "error_code": code,
+                    },
+                )
+                await _sleep(delay)
+                continue
+            raise _from_api_error(stage, exc, chat_id, update_id) from None
+        except genai_errors.UnknownApiResponseError as exc:
+            # The SDK received something it could not read: a reply we cannot
+            # use, not an outage. `str(exc)` is not rendered.
+            raise _reject(
+                stage,
+                f"the SDK could not read the reply ({type(exc).__name__})",
+                chat_id=chat_id,
+                update_id=update_id,
+            ) from None
+        except Exception as exc:
+            # Final catch-all, and it has to be one: `google.genai` reads the 200
+            # body *inside* `generate_content` - `json.loads`, then its own
+            # converters, then pydantic - so a body its parser cannot turn into a
+            # `GenerateContentResponse` raises before `_typed_reply` ever sees an
+            # object. Those failures are none of the four types above: with
+            # google-genai 2.28.0 the escaping set is `ValidationError`,
+            # `JSONDecodeError`, `TypeError` and `AttributeError`, and the first
+            # carries the raw body in `str(exc)` as `input_value=...`.
+            #
+            # `_reject`, not `_unavailable`: a 200 that the gateway or the SDK
+            # cannot read is a reply we were handed and could not use - a defect
+            # at the reply end, like `UnknownApiResponseError` - rather than a
+            # network, quota or 5xx outage, so it must be the loud class and
+            # must not advertise the session as worth retrying (R1.6).
+            #
+            # Class name only, never `str(exc)`/`repr(exc)`, and `from None` so
+            # the `@logged` decorator's `exc_info` traceback cannot reach the
+            # original either (R1.7, and this function's own invariant above).
+            raise _reject(
+                stage,
+                f"the SDK could not read the reply ({type(exc).__name__})",
+                chat_id=chat_id,
+                update_id=update_id,
+            ) from None
 
 
 async def _generate_content(
@@ -1070,16 +1128,20 @@ def _from_api_error(
     chat_id: int | None,
     update_id: int | None,
 ) -> GeminiError:
-    """Classify an `APIError` into unavailable or rejected (R1.6).
+    """Classify an `APIError` into throttled, unavailable or rejected (R1.6).
 
     Only the class name and `code` are read. `exc.details` - the raw response
     body - and `exc.message` are never touched (R1.7).
+
+    The ``429`` branch is split out *ahead* of the server branch (R1.1/D4): a
+    throttle is a strict refinement of "unavailable", so it must be recognised
+    before the broader ``ServerError``/5xx test can swallow it.
     """
     code = _code_of(exc)
-    if (
-        isinstance(exc, genai_errors.ServerError)
-        or code == _THROTTLED_CODE
-        or (code is not None and code >= 500)
+    if code == _THROTTLED_CODE:
+        return _throttled(stage, exc, chat_id, update_id, code=code)
+    if isinstance(exc, genai_errors.ServerError) or (
+        code is not None and code >= 500
     ):
         return _unavailable(
             stage,
@@ -1135,6 +1197,42 @@ def _unavailable(
     return GeminiUnavailableError(
         stage=stage,
         reason=reason,
+        error_type=error_type,
+        error_code=error_code,
+    )
+
+
+def _throttled(
+    stage: Stage,
+    exc: BaseException,
+    chat_id: int | None,
+    update_id: int | None,
+    *,
+    code: int | None = None,
+) -> GeminiThrottledError:
+    """Build and log a throttle, reading only `type(exc)` and `code` (R1.9).
+
+    The record is ``gemini_throttled`` at ERROR - the attempts are spent and the
+    user is about to be told to try again shortly - and carries the class name,
+    stage and code, never ``str(exc)``.
+    """
+    error_type = type(exc).__name__
+    error_code = code if code is not None else _code_of(exc)
+    logger.error(
+        "gemini_throttled",
+        extra={
+            "event": "gemini_throttled",
+            "stage": stage.value,
+            "model": MODEL_ID,
+            "chat_id": chat_id,
+            "update_id": update_id,
+            "error_type": error_type,
+            "error_code": error_code,
+        },
+    )
+    return GeminiThrottledError(
+        stage=stage,
+        reason="the API throttled the request",
         error_type=error_type,
         error_code=error_code,
     )

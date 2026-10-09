@@ -23,10 +23,11 @@ Five stages, orchestrated by the Interviewer:
 Transport is Telegram **long polling**. No webhooks, no public URL, no open
 ports — the bot dials out to Telegram.
 
-> **Current state:** stages 1, 2 and 4 — Bouncer, Interviewer and Scripter —
-> are wired end to end, so the text slice works: send a portrait photo, answer
-> 5–7 questions, get the narration as a message. The hybrid image (Converter)
-> and the voice note (Narrator) are **not** built yet. Scroll to
+> **Current state:** stages 1, 2, 4 and 5 — Bouncer, Interviewer, Scripter and
+> Narrator — are wired end to end: send a portrait photo, answer 5–7 questions,
+> get a voice note reading the narration (text if synthesis fails). The hybrid
+> image (Converter) is the one outstanding stage — **blocked on image-generation
+> quota** on the project's API key, a billing matter, not a code one. Scroll to
 > [Status](#status).
 
 ## Setup
@@ -71,7 +72,8 @@ python -m telegram_documentaries
 ```
 /start            greet you and ask for a photo
 <portrait photo>  pass the Bouncer, then answer 5–7 questions
-                  -> receive the narration as a message
+                  -> receive a voice note reading the narration
+                  (if the speech call fails, the narration arrives as text)
 /restart          at any time: wipe the session and start over
 ```
 
@@ -80,9 +82,10 @@ note gets `unsupported_media`; a photo that fails the vision gate gets the
 Bouncer's rejection; a text message arriving before the photo gets a nudge back
 to the conversation. One reply per message, always.
 
-The hybrid animal image and the voice note are not built yet — when the
-interview finishes you get the narration as **text**. See
-`SPECS/ROADMAP.md`.
+The hybrid animal image is not built yet — the Converter is blocked on
+image-generation quota for the project's API key, a billing matter. When the
+interview finishes you get the narration as a **voice note** (or as text if
+the speech call fails). See `SPECS/ROADMAP.md`.
 
 ## How it is built
 
@@ -92,9 +95,10 @@ behind them.
 ### One module is allowed to talk to Gemini
 
 ```
-bot.py ──▶ pipeline.py ──┬──▶ bouncer.py ───────┐
-          (the decision  ├──▶ interviewer.py ──┼──▶ gemini.py ──▶ google.genai
-           table)        └──▶ scripter.py ─────┘
+bot.py ──▶ pipeline.py ──┬──▶ bouncer.py ─────┐
+          (the decision  ├──▶ interviewer.py ─┼──▶ gemini.py ──▶ google.genai
+           table)        ├──▶ scripter.py ────┘
+                         └──▶ narrator.py ────────────▶ gemini.py (TTS)
 ```
 
 No stage imports the SDK. A stage builds a typed `GeminiRequest` and gets back
@@ -109,16 +113,19 @@ constructs a hub — `__main__` builds the collaborators and injects them. The
 consequences live in `state.py`, a plain class with no I/O, so the decision
 table is testable without Telegram, Gemini or a filesystem.
 
-### Two kinds of Gemini failure, kept apart
+### Three kinds of Gemini failure, kept apart
 
 | Error | Means | What the user experiences |
 |---|---|---|
-| `GeminiUnavailableError` | Timeout, network failure, 5xx, rate limit | Retry later. The session survives. |
+| `GeminiThrottledError` | The API is rate-limiting (429) and the bounded retry ran out | "Give me a moment and send that again." The session survives — the resend is consumed as the answer already on screen. |
+| `GeminiUnavailableError` | Timeout, network failure, 5xx | Retry later. The session survives. |
 | `GeminiResponseError` | A reply arrived and was unusable | Something is wrong with the model's output. Escalate. |
 
 Collapsing these into one exception would force a choice between losing a
 half-finished interview on a rate limit, and hiding a broken reply behind a
-friendly "try again".
+friendly "try again". Throttles are retried briefly (three attempts, 1 s then
+2 s); nothing else is, because a retry on a slow call holds the chat open for
+nothing.
 
 ### Rejected, never repaired
 
@@ -181,12 +188,13 @@ src/telegram_documentaries/
   bouncer.py      the vision gate
   interviewer.py  5–7 questions, one at a time
   scripter.py     the 60–90 word narration, one corrective retry
+  narrator.py     waveform -> MP3 voice note (lameenc, voice Kore) — not an agent
   media.py        MediaStore, the local file tree
   gemini.py       the only module that imports google.genai
   config.py       Settings from .env, both secrets as SecretStr
   observability.py  configure_logging, get_logger, @logged
 
-tests/unit/       474 tests, no network, no real credentials
+tests/unit/       608 tests, no network, no real credentials
 SPECS/            the constitution, and one folder per feature
 ```
 
@@ -210,7 +218,9 @@ Never implement directly on `main`.
 - `SPECS/TECH.md` — the technical contract: stack, architecture, policies
 - `SPECS/ROADMAP.md` — the ordered build plan
 - `SPECS/2026-10-05-repository-and-gateway/` — Phase 1, shipped
-- `SPECS/2026-10-05-text-vertical-slice/` — the slice in progress
+- `SPECS/2026-10-05-text-vertical-slice/` — Phases 2/3/5 text slice, shipped
+- `SPECS/2026-10-08-narrator-voice-note/` — Phase 6, shipped and live-verified
+- `SPECS/2026-10-09-resilience/` — Phase 7, shipped
 - `.guides/img/` — wildlife mascot reference art
 
 ## Status
@@ -218,20 +228,20 @@ Never implement directly on `main`.
 | Phase | What it delivers | State |
 |---|---|---|
 | 1 | Repository and `/start` gateway | **Done** — verified against the live bot |
-| 2–5 | Text slice: photo → Bouncer → Interviewer → Scripter | **Implemented** — 474 tests green, live smoke test pending |
-| 3 (img) | Converter: the hybrid animal portrait | Not started |
-| 6 | Narrator: the voice note | Not started |
-| 7 | Hardening and polish | Not started |
+| 2–5 | Photo → Bouncer → Interviewer → Scripter → Narrator | **Done** — 608 tests green; voice note delivered live (`narration_delivered` + `voice_note_sent`) |
+| 3 (img) | Converter: the hybrid animal portrait | **Blocked** — image-generation quota on the project's API key (`429` on every image model); resumes when billing is enabled |
+| 7 | Hardening and polish | **Done** — per-class timeouts, bounded 429 retry, wrong-payload matrix, no-silent-except guard |
 
-Phases 2 and 3 of the roadmap are being built together as one vertical slice, so
-that a real narration arrives as Telegram *text* before any image or audio work
-begins. That gives something phone-testable much earlier, and keeps the riskiest
-part — a stateful multi-turn conversation — small and provable on its own.
+Phases 2–4 of the roadmap were built together as one vertical slice so that a
+real narration arrives early, then the Narrator (Phase 6) gave it a voice. The
+riskiest part — a stateful multi-turn conversation — stays small and provable
+on its own, and the voice note was verified live before Phase 7's hardening.
 
 **What you can do today:** `/start`, send a portrait photo, answer 5–7
-questions, read the narration, `/restart`. **What you cannot do yet:** see the
-hybrid animal image, or hear the voice note — those are the Converter and the
-Narrator, both still ahead.
+questions, hear the narration as a **voice note** (or read it as text if the
+speech call fails), `/restart`. **What you cannot do yet:** see the hybrid
+animal image — the Converter is blocked on image-generation quota, a billing
+matter, not a code one.
 
 See `SPECS/ROADMAP.md` for the full plan.
 

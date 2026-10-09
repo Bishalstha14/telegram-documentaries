@@ -123,9 +123,15 @@ class FakeTransport:
     back - the schema-first and inline-data guards need the request side.
     """
 
-    def __init__(self, reply: Any = None, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        reply: Any = None,
+        error: BaseException | None = None,
+        script: list[types.GenerateContentResponse | BaseException] | None = None,
+    ) -> None:
         self._reply = reply
         self._error = error
+        self._script = list(script) if script is not None else None
         self.calls: list[RecordedCall] = []
 
     async def generate_content(
@@ -136,6 +142,14 @@ class FakeTransport:
         config: types.GenerateContentConfig,
     ) -> types.GenerateContentResponse:
         self.calls.append(RecordedCall(model=model, contents=contents, config=config))
+        if self._script is not None:
+            # A scripted sequence: each call yields the next item, raising it if
+            # it is an exception. This is what lets a retry test hand the client
+            # "429, 429, success" and assert the third call actually happened.
+            item = self._script.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
         if self._error is not None:
             raise self._error
         assert self._reply is not None, "FakeTransport needs a reply or an error"
@@ -939,6 +953,197 @@ async def test_an_unavailable_error_is_not_rejected_as_a_bad_reply() -> None:
         await _generate(_client(transport))
 
     assert not isinstance(excinfo.value, GeminiResponseError)
+
+
+# ==========================================================================
+# R1.1 - a 429 is its own failure: a strict refinement of unavailable.
+# ==========================================================================
+
+
+async def test_generate_raises_a_throttled_error_on_a_429() -> None:
+    """R1.1: the throttle has its own type, so a caller can specialise."""
+    transport = FakeTransport(error=errors.ClientError(429, {"error": {"message": "quota"}}))
+
+    with pytest.raises(gemini.GeminiThrottledError):
+        await _generate(_client(transport))
+
+
+def test_the_throttled_error_is_a_strict_refinement_of_unavailable() -> None:
+    """R1.1: every existing `except GeminiUnavailableError` stays correct."""
+    assert issubclass(gemini.GeminiThrottledError, GeminiUnavailableError)
+    assert issubclass(gemini.GeminiThrottledError, gemini.GeminiError)
+    assert not issubclass(GeminiUnavailableError, gemini.GeminiThrottledError)
+
+
+async def test_a_server_error_is_not_the_throttle_type() -> None:
+    """R1.1: a 5xx is a plain outage and must not be conflated with a throttle."""
+    transport = FakeTransport(error=errors.ServerError(500, {"error": {"message": "boom"}}))
+
+    with pytest.raises(GeminiUnavailableError) as excinfo:
+        await _generate(_client(transport))
+
+    assert type(excinfo.value) is GeminiUnavailableError
+    assert not isinstance(excinfo.value, gemini.GeminiThrottledError)
+
+
+async def test_the_throttled_error_carries_the_stage_reason_and_code() -> None:
+    transport = FakeTransport(error=errors.ClientError(429, {"error": {"message": "quota"}}))
+
+    with pytest.raises(gemini.GeminiThrottledError) as excinfo:
+        await _generate(_client(transport), _request(stage=Stage.SCRIPTER))
+
+    error = excinfo.value
+    assert error.stage is Stage.SCRIPTER
+    assert error.error_code == 429
+    assert error.reason
+    assert str(error), "the message must never be empty"
+
+
+async def test_a_throttle_logs_the_throttled_record_without_str_exc(
+    app_records: LogRecords,
+) -> None:
+    """R1.9: `gemini_throttled` names the stage and code, and leaks nothing."""
+    transport = FakeTransport(
+        error=errors.ClientError(
+            429, {"error": {"message": f"quota: {RESPONSE_BODY_SENTINEL}"}}
+        )
+    )
+
+    with pytest.raises(gemini.GeminiThrottledError) as excinfo:
+        await _generate(_client(transport))
+
+    records = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_throttled"
+    ]
+    assert records, "a throttle must be logged, never silent"
+    context = records[0]
+    assert context["stage"] == "bouncer"
+    assert context["error_code"] == 429
+    assert context["error_type"] == "ClientError"
+    assert RESPONSE_BODY_SENTINEL not in _rendered(app_records.records)
+    assert RESPONSE_BODY_SENTINEL not in f"{excinfo.value!s}{excinfo.value!r}"
+
+
+# ==========================================================================
+# R1.2/R1.3 - a 429 is retried, bounded, and nothing else is (Phase 7).
+# ==========================================================================
+
+
+@pytest.fixture
+def no_wait(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture the throttle backoff instead of sleeping (R1.4).
+
+    The only monkeypatch in Phase 7: the delay exists as a seam precisely so the
+    suite proves the *policy* - attempts and delays - without spending the
+    seconds it describes.
+    """
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(gemini, "_sleep", fake_sleep)
+    return delays
+
+
+async def test_a_throttle_is_retried_before_it_is_reported(
+    no_wait: list[float],
+) -> None:
+    """R1.2: two 429s then a success - the user never learns it happened."""
+    transport = FakeTransport(
+        script=[
+            errors.ClientError(429, {"error": {"message": "quota"}}),
+            errors.ClientError(429, {"error": {"message": "quota"}}),
+            _reply(json.dumps({"verdict": "HUMAN", "subject": "a woman"})),
+        ]
+    )
+
+    verdict = await _generate(_client(transport))
+
+    assert verdict.verdict == "HUMAN"
+    assert len(transport.calls) == 3, "a retry must actually re-call the transport"
+    assert no_wait == [1.0, 2.0]
+
+
+async def test_the_retry_bound_holds_when_the_throttle_persists(
+    no_wait: list[float],
+) -> None:
+    """R1.2: repeated 429s exhaust the bound and raise."""
+    transport = FakeTransport(
+        error=errors.ClientError(429, {"error": {"message": "quota"}})
+    )
+
+    with pytest.raises(gemini.GeminiThrottledError):
+        await _generate(_client(transport))
+
+    assert gemini._THROTTLE_MAX_ATTEMPTS == 3
+    assert len(transport.calls) == gemini._THROTTLE_MAX_ATTEMPTS
+    assert no_wait == [1.0, 2.0]
+
+
+async def test_a_server_error_is_not_retried(no_wait: list[float]) -> None:
+    """R1.3: a 5xx fails once - the retry is for throttles only."""
+    transport = FakeTransport(error=errors.ServerError(500, {"error": {"message": "boom"}}))
+
+    with pytest.raises(GeminiUnavailableError):
+        await _generate(_client(transport))
+
+    assert len(transport.calls) == 1
+    assert no_wait == []
+
+
+async def test_a_timeout_is_not_retried(no_wait: list[float]) -> None:
+    """R1.3: retrying a timeout would hold the chat open - so it is not."""
+    transport = FakeTransport(error=httpx.ReadTimeout("too slow"))
+
+    with pytest.raises(GeminiUnavailableError):
+        await _generate(_client(transport))
+
+    assert len(transport.calls) == 1
+    assert no_wait == []
+
+
+async def test_a_retried_throttle_is_logged_before_each_attempt(
+    no_wait: list[float],
+    app_records: LogRecords,
+) -> None:
+    """R1.9: `gemini_throttled_retry` names the attempt, delay and code."""
+    transport = FakeTransport(
+        script=[
+            errors.ClientError(429, {"error": {"message": "quota"}}),
+            errors.ClientError(429, {"error": {"message": "quota"}}),
+            _reply(json.dumps({"verdict": "HUMAN", "subject": "a woman"})),
+        ]
+    )
+
+    await _generate(_client(transport))
+
+    retries = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_throttled_retry"
+    ]
+    assert [r["attempt"] for r in retries] == [1, 2]
+    assert [r["delay"] for r in retries] == [1.0, 2.0]
+    assert [r["error_code"] for r in retries] == [429, 429]
+
+
+async def test_synthesize_retries_a_throttle_too(no_wait: list[float]) -> None:
+    """R1.2: the retry lives at the shared seam, so synthesis inherits it."""
+    transport = FakeTransport(
+        script=[
+            errors.ClientError(429, {"error": {"message": "quota"}}),
+            _audio_reply(),
+        ]
+    )
+
+    audio = await _synthesize(_client(transport))
+
+    assert audio.sample_rate == 24000
+    assert len(transport.calls) == 2
+    assert no_wait == [1.0]
 
 
 # ==========================================================================

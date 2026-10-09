@@ -35,7 +35,7 @@ both callers reuse it (D7).
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     AfterValidator,
@@ -55,7 +55,10 @@ __all__ = [
     "InvalidInboundUpdateError",
     "MediaKind",
     "PhotoAttachment",
+    "Reply",
     "UnsupportedAttachment",
+    "VoiceNote",
+    "has_mp3_header",
     "validation_error_fields",
 ]
 
@@ -401,3 +404,75 @@ def _text_of(message: object) -> str | None:
     """
     text = getattr(message, "text", None)
     return text if isinstance(text, str) else None
+
+
+# --------------------------------------------------------------------------
+# The outbound reply contract: `VoiceNote` and `Reply` (R2.1, R2.2)
+#
+# The models above guard what comes *in* from Telegram. `VoiceNote` guards what
+# goes *out*: the adapter uploads these bytes, so they are proven to be a
+# sendable MP3 at the edge, exactly as an inbound photo is proven before it is
+# written to disk.
+# --------------------------------------------------------------------------
+
+#: Telegram's ``sendVoice`` ceiling, in bytes (50 MB). A note at or above this
+#: cannot be uploaded at all, so it is refused before it is ever offered.
+_TELEGRAM_VOICE_NOTE_MAX_BYTES = 50 * 1024 * 1024
+
+
+def has_mp3_header(data: bytes) -> bool:
+    """Whether `data` opens as an MP3 (R2.1).
+
+    Two openings are accepted: an ID3v2 tag (``b"ID3"``), or an MPEG frame sync,
+    where the first byte is ``0xFF`` and the top three bits of the second are
+    set. Together they cover what Telegram's ``sendVoice`` will accept.
+
+    A named helper rather than an inline expression because the Narrator reuses
+    it to check the bytes its own encoder produced (R2.6) before they leave that
+    module - one definition, so the inbound and outbound checks cannot drift.
+    """
+    if data.startswith(b"ID3"):
+        return True
+    return len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+
+
+def _require_mp3_header(data: bytes) -> bytes:
+    """Pydantic adapter for :func:`has_mp3_header`; returns the value unchanged."""
+    if not has_mp3_header(data):
+        raise ValueError("must begin with an ID3 tag or an MPEG frame sync")
+    return data
+
+
+class VoiceNote(BaseModel):
+    """A sendable voice note: validated at the *outbound* Telegram boundary.
+
+    ``data`` is checked before the send is attempted - non-empty, strictly below
+    Telegram's ``sendVoice`` ceiling, and opening as an MP3 - so the adapter is
+    handed something already proven uploadable. ``fallback_text`` carries the
+    narration as plain text, so if the voice send fails the adapter can still
+    deliver it (D9); the reply itself guarantees the narration survives, whatever
+    happens to the audio.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: Encoded MP3 bytes. Telegram's ceiling is inclusive at the top, so the
+    #: bound is strictly below it: ``max_length`` of ``limit - 1``.
+    data: Annotated[
+        bytes,
+        Field(min_length=1, max_length=_TELEGRAM_VOICE_NOTE_MAX_BYTES - 1),
+        AfterValidator(_require_mp3_header),
+    ]
+    #: Telegram accepts MP3 for a voice note; any other type is a caller bug.
+    mime_type: Literal["audio/mpeg"]
+    #: Playback length, derived upstream from the PCM sample count.
+    duration_seconds: float = Field(gt=0)
+    #: The narration as text, delivered if the voice send fails (D9).
+    fallback_text: Annotated[str, Field(min_length=1), AfterValidator(_non_blank)]
+
+
+#: What a ``handle_*`` method returns for one update: the narration as a
+#: `VoiceNote` on success, and - because `VoiceNote` carries its own
+#: `fallback_text` - still exactly one object when delivery degrades to text
+#: (D4, R2.2).
+Reply = str | VoiceNote

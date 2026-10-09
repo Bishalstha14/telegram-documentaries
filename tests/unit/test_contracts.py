@@ -316,7 +316,10 @@ def test_contracts_module_exports_only_the_public_surface() -> None:
         "InvalidInboundUpdateError",
         "MediaKind",
         "PhotoAttachment",
+        "Reply",
         "UnsupportedAttachment",
+        "VoiceNote",
+        "has_mp3_header",
         "validation_error_fields",
     }
 
@@ -805,3 +808,137 @@ def test_the_union_is_exported_from_the_contracts_surface() -> None:
         "MediaKind",
     ):
         assert name in contracts.__all__, name
+
+
+# --------------------------------------------------------------------------
+# R2.1 / R2.2 - the outbound reply contract: `VoiceNote` and `Reply`
+#
+# `VoiceNote` is the *outbound* Telegram boundary: the adapter uploads it. It is
+# validated here so the adapter is handed bytes already proven to be a sendable
+# MP3, and it carries its own `fallback_text` so a failed voice send can still
+# deliver the narration (D9).
+# --------------------------------------------------------------------------
+
+#: A minimal ID3v2 head: three bytes of magic, then version, flags and size.
+_ID3_HEAD = b"ID3\x03\x00\x00\x00\x00\x00\x00"
+
+#: A minimal MPEG frame sync: `0xFF` with the next byte's top three bits set.
+_MPEG_SYNC = b"\xff\xfb"
+
+#: Telegram's `sendVoice` ceiling, by the spec's own definition (R2.1).
+_TELEGRAM_VOICE_NOTE_LIMIT = 50 * 1024 * 1024
+
+
+def _voice_note(**overrides: Any) -> Any:
+    """A well-formed `VoiceNote`, with any field overridable."""
+    fields: dict[str, Any] = {
+        "data": _ID3_HEAD + b"\x00" * 64,
+        "mime_type": "audio/mpeg",
+        "duration_seconds": 1.5,
+        "fallback_text": "The narration, as text.",
+    }
+    fields.update(overrides)
+    return contracts.VoiceNote(**fields)
+
+
+@pytest.mark.parametrize("head", [_ID3_HEAD, _MPEG_SYNC])
+def test_voice_note_accepts_a_note_that_opens_as_an_mp3(head: bytes) -> None:
+    """R2.1: an ID3 tag or an MPEG frame sync are both valid MP3 openings."""
+    note = _voice_note(data=head + b"\x00" * 32)
+
+    assert note.mime_type == "audio/mpeg"
+    assert note.data.startswith(head)
+    assert note.duration_seconds == 1.5
+    assert note.fallback_text == "The narration, as text."
+
+
+def test_voice_note_rejects_empty_data() -> None:
+    with pytest.raises(ValidationError):
+        _voice_note(data=b"")
+
+
+def test_voice_note_rejects_a_head_that_is_neither_id3_nor_a_frame_sync() -> None:
+    """R2.1: `GIF89a` is not an MP3, whatever the extension claimed."""
+    with pytest.raises(ValidationError):
+        _voice_note(data=b"GIF89a" + b"\x00" * 16)
+
+
+def test_voice_note_rejects_a_0xff_byte_without_the_frame_sync_bits() -> None:
+    """`0xFF` alone is not a sync: the second byte's top three bits must be set."""
+    with pytest.raises(ValidationError):
+        _voice_note(data=b"\xff\x1f" + b"\x00" * 16)
+
+
+def test_voice_note_rejects_a_mime_type_other_than_audio_mpeg() -> None:
+    """The `Literal` is the contract; Telegram would reject anything else."""
+    with pytest.raises(ValidationError):
+        _voice_note(mime_type="audio/ogg")
+
+
+@pytest.mark.parametrize("duration", [0, -1.0])
+def test_voice_note_rejects_a_non_positive_duration(duration: float) -> None:
+    with pytest.raises(ValidationError):
+        _voice_note(duration_seconds=duration)
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n\t"])
+def test_voice_note_rejects_blank_fallback_text(text: str) -> None:
+    """D9: a blank fallback could not deliver the narration if the send failed."""
+    with pytest.raises(ValidationError):
+        _voice_note(fallback_text=text)
+
+
+def test_voice_note_rejects_an_extra_field() -> None:
+    """`extra="forbid"`: the contract is exact, not a superset."""
+    with pytest.raises(ValidationError):
+        _voice_note(caption="not a field")
+
+
+def test_voice_note_is_frozen() -> None:
+    note = _voice_note()
+
+    with pytest.raises(ValidationError):
+        note.duration_seconds = 9.0  # type: ignore[misc]
+
+
+def test_voice_note_rejects_data_at_the_telegram_limit() -> None:
+    """R2.1: the note must be *below* Telegram's 50 MB `sendVoice` limit."""
+    data = _ID3_HEAD + b"\x00" * (_TELEGRAM_VOICE_NOTE_LIMIT - len(_ID3_HEAD))
+
+    assert len(data) == _TELEGRAM_VOICE_NOTE_LIMIT
+    with pytest.raises(ValidationError):
+        _voice_note(data=data)
+
+
+def test_voice_note_accepts_data_just_below_the_telegram_limit() -> None:
+    """The boundary is inclusive-below: one byte under the ceiling is valid."""
+    data = _ID3_HEAD + b"\x00" * (_TELEGRAM_VOICE_NOTE_LIMIT - 1 - len(_ID3_HEAD))
+
+    note = _voice_note(data=data)
+
+    assert len(note.data) == _TELEGRAM_VOICE_NOTE_LIMIT - 1
+
+
+def test_has_mp3_header_recognises_id3_and_sync_and_rejects_others() -> None:
+    """The one shared header check, reused by `VoiceNote` and the Narrator."""
+    assert contracts.has_mp3_header(_ID3_HEAD)
+    assert contracts.has_mp3_header(_MPEG_SYNC)
+    assert not contracts.has_mp3_header(b"")
+    assert not contracts.has_mp3_header(b"\xff")
+    assert not contracts.has_mp3_header(b"\xff\x1f")
+    assert not contracts.has_mp3_header(b"GIF89a")
+
+
+def test_reply_accepts_a_plain_string() -> None:
+    """R2.2: every non-narration row still returns a `str`."""
+    assert isinstance("a narration", contracts.Reply)
+
+
+def test_reply_accepts_a_voice_note() -> None:
+    assert isinstance(_voice_note(), contracts.Reply)
+
+
+def test_reply_is_a_union_not_any_object() -> None:
+    """R2.2: `str | VoiceNote`, so an unrelated type is not a reply."""
+    assert not isinstance(b"not a reply", contracts.Reply)
+    assert not isinstance(True, contracts.Reply)

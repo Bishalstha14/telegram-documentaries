@@ -22,23 +22,31 @@ Nothing here touches the network or a real credential.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeGeminiClient, FakePhotoFetcher, FakeTelegramBot
+from conftest import (
+    FakeGeminiClient,
+    FakePhotoFetcher,
+    FakeTelegramBot,
+    LogRecorder,
+)
 from telegram import Bot, Update
 
 from telegram_documentaries.bouncer import BouncerVerdict, Verdict
-from telegram_documentaries.contracts import InboundUpdate
+from telegram_documentaries.contracts import InboundUpdate, Reply, VoiceNote
 from telegram_documentaries.gemini import (
     GeminiUnavailableError,
     Stage,
+    SynthesizedAudio,
 )
 from telegram_documentaries.interviewer import InterviewPlan, Question
 from telegram_documentaries.media import MediaStore
 from telegram_documentaries.pipeline import (
+    GENERIC_FAILURE,
     PHOTO_MIME_TYPE,
     WELCOME,
     ConversationPipeline,
@@ -161,18 +169,75 @@ def inbound(payload: dict[str, Any], update_id: int = UPDATE) -> InboundUpdate:
 # --------------------------------------------------------------------------
 
 
+#: One whole MPEG-2 frame of mono `s16le` PCM at 24 kHz (576 samples, 1152
+#: bytes). The script row now runs the *real* narrator, so the synthesis fake
+#: must hand back a frame the real encoder can write (R5.2).
+PCM_SAMPLES = 576
+PCM_AUDIO = SynthesizedAudio(
+    data=b"\x00\x00" * PCM_SAMPLES,
+    mime_type="audio/l16; rate=24000; channels=1",
+)
+#: Fewer bytes than one MPEG frame, so the real narrator refuses to encode it.
+TOO_SHORT_AUDIO = SynthesizedAudio(
+    data=b"\x00\x00",
+    mime_type="audio/l16; rate=24000; channels=1",
+)
+
+
+class _SynthesizingGeminiClient(FakeGeminiClient):
+    """`FakeGeminiClient` plus the TTS seam the script row now needs.
+
+    The shared fake implements only `generate`. `_write_script` calls
+    `narrator.narrate`, which calls `synthesize`, so the pipeline harness needs a
+    client that speaks both halves of the `GeminiClient` protocol (D-V2). This
+    lives here rather than in `conftest.py` because the pipeline is the only
+    caller that reaches synthesis through `narrate`.
+
+    `synthesize` deliberately does not append to `calls`/`call_count`: those
+    count generation calls, and the existing assertions depend on that. It is
+    recorded separately on `synth_calls`.
+    """
+
+    def __init__(
+        self,
+        replies: list[Any] | None = None,
+        *,
+        error: BaseException | None = None,
+        synth_audio: SynthesizedAudio | None = None,
+        synth_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(replies, error=error)
+        self.synth_audio = synth_audio if synth_audio is not None else PCM_AUDIO
+        self.synth_error = synth_error
+        self.synth_calls: list[dict[str, Any]] = []
+
+    async def synthesize(
+        self, text: str, voice: str, chat_id: int, update_id: int
+    ) -> SynthesizedAudio:
+        self.synth_calls.append(
+            {"text": text, "voice": voice, "chat_id": chat_id, "update_id": update_id}
+        )
+        if self.synth_error is not None:
+            raise self.synth_error
+        return self.synth_audio
+
+
 @dataclass
 class Harness:
     """One pipeline under test, with every seam replaced by a fake."""
 
     pipeline: ConversationPipeline
-    client: FakeGeminiClient
+    client: _SynthesizingGeminiClient
     sessions: SessionStore
     media: MediaStore
     fetcher: FakePhotoFetcher
     bot: FakeTelegramBot = field(default_factory=FakeTelegramBot)
+    #: Voice notes the adapter would upload, kept apart from `bot.sent` so the
+    #: existing text assertions keep their meaning. The real adapter branches on
+    #: type (`bot.py`, group 7); this harness just records what the row returned.
+    voice_notes: list[VoiceNote] = field(default_factory=list)
 
-    async def send(self, update: InboundUpdate) -> str:
+    async def send(self, update: InboundUpdate) -> Reply:
         """Run one update and record the reply the adapter would send."""
         if update.text == "/start":
             reply = await self.pipeline.handle_start(update)
@@ -180,7 +245,10 @@ class Harness:
             reply = await self.pipeline.handle_restart(update)
         else:
             reply = await self.pipeline.handle_message(update)
-        await self.bot.send_message(chat_id=update.chat_id, text=reply)
+        if isinstance(reply, VoiceNote):
+            self.voice_notes.append(reply)
+        else:
+            await self.bot.send_message(chat_id=update.chat_id, text=reply)
         return reply
 
     def phase(self, chat_id: int = CHAT) -> Phase:
@@ -201,9 +269,13 @@ def _harness(
     replies: list[Any] | None = None,
     *,
     error: BaseException | None = None,
+    synth_audio: SynthesizedAudio | None = None,
+    synth_error: BaseException | None = None,
     fetcher: FakePhotoFetcher | None = None,
 ) -> Harness:
-    client = FakeGeminiClient(replies, error=error)
+    client = _SynthesizingGeminiClient(
+        replies, error=error, synth_audio=synth_audio, synth_error=synth_error
+    )
     store = SessionStore()
     media = MediaStore(base_dir=tmp_path / "media")
     fetch = fetcher or FakePhotoFetcher([PHOTO_BYTES])
@@ -262,11 +334,11 @@ async def test_start_is_a_welcome_from_the_hub_not_a_transport_constant(
     assert reply == WELCOME
 
 
-async def test_the_welcome_promises_only_what_exists() -> None:
-    """R9.4: the /start text must not claim the image or the voice note."""
+async def test_the_welcome_promises_the_voice_note_and_only_what_exists() -> None:
+    """R3.6: the /start text promises the voice note; the image does not exist."""
     lower = WELCOME.lower()
     assert "portrait" in lower
-    assert "voice" not in lower
+    assert "voice" in lower
     assert "hybrid" not in lower
     assert "not built" not in lower
 
@@ -539,16 +611,23 @@ async def test_answers_are_recorded_in_order(tmp_path: Path) -> None:
 async def test_the_interview_completes_after_five_to_seven_answers_and_sends_the_script(
     tmp_path: Path,
 ) -> None:
-    """The happy path, end to end: narration is the last message, same chat."""
+    """The happy path, end to end: narration is the last reply, same chat.
+
+    Updated by R3.1/D4: the narration is now delivered as a `VoiceNote`, whose
+    `fallback_text` carries the exact narration. The voice note still goes to
+    the update's own chat (asserted through the synthesis seam).
+    """
     h = _harness(tmp_path, _happy_replies())
     await h.send(inbound(_photo_message()))
 
-    for n in range(5):
+    for n in range(4):
         await h.send(inbound(_text_message(f"Answer {n}.")))
+    reply = await h.send(inbound(_text_message("Answer 4.")))
 
     assert h.phase() is Phase.SCRIPTED
-    assert h.bot.sent[-1]["chat_id"] == CHAT
-    assert h.bot.sent[-1]["text"] == SCRIPT.text
+    assert isinstance(reply, VoiceNote)
+    assert reply.fallback_text == SCRIPT.text
+    assert h.client.synth_calls[-1]["chat_id"] == CHAT
     assert h.state().script == SCRIPT
 
 
@@ -781,7 +860,8 @@ async def test_a_failure_on_the_final_answer_re_asks_the_same_question(
     h.client.replies = [SCRIPT]
     reply = await h.send(inbound(_text_message("Answer 4, second try.")))
 
-    assert reply == SCRIPT.text
+    assert isinstance(reply, VoiceNote)
+    assert reply.fallback_text == SCRIPT.text
     assert h.phase() is Phase.SCRIPTED
     assert len(h.state().answers) == 5
     assert h.state().answers[-1].answer == "Answer 4, second try."
@@ -1166,3 +1246,173 @@ def test_the_hub_depends_on_the_fetch_port_not_the_sdk() -> None:
 
     assert "telegram" not in imported
     assert "google" not in imported
+
+
+# --------------------------------------------------------------------------
+# R3 - the script row: deliver the narration as a voice note, fall back to text
+#
+# The script *was* written and the session is *finished* before any of this
+# happens. A delivery failure is a degradation, not a pipeline failure: the user
+# still gets the narration, as text, and never `GENERIC_FAILURE` (D6/R3.4).
+# --------------------------------------------------------------------------
+
+
+def _events(recorder: LogRecorder, event: str) -> list[logging.LogRecord]:
+    """Every record one run emitted for `event`, in emission order."""
+    return [
+        record
+        for record in recorder.records
+        if recorder.extra_of(record).get("event") == event
+    ]
+
+
+async def _finish_interview(h: Harness) -> Reply:
+    """Drive one chat from nothing to the finished narration, one update at a time."""
+    await h.send(inbound(_photo_message()))
+    for n in range(4):
+        await h.send(inbound(_text_message(f"Answer {n}.")))
+    return await h.send(inbound(_text_message("Answer 4.")))
+
+
+async def test_the_script_row_delivers_the_narration_as_one_voice_note(
+    tmp_path: Path,
+) -> None:
+    """R3.1/R3.5: the narration is one `VoiceNote`, not a list and not a `str`."""
+    h = _harness(tmp_path, _happy_replies())
+
+    reply = await _finish_interview(h)
+
+    assert isinstance(reply, VoiceNote)
+    assert reply.mime_type == "audio/mpeg"
+    assert reply.fallback_text == SCRIPT.text
+    assert reply.duration_seconds == pytest.approx(PCM_SAMPLES / 24_000)
+    assert not isinstance(reply, (list, tuple))
+    assert h.voice_notes == [reply]
+    assert h.phase() is Phase.SCRIPTED
+    assert h.state().script == SCRIPT
+
+
+async def test_a_delivered_narration_logs_the_audio_facts(
+    tmp_path: Path, app_records: LogRecorder
+) -> None:
+    """R3.3: `narration_delivered` carries word count, duration and byte size."""
+    h = _harness(tmp_path, _happy_replies())
+
+    reply = await _finish_interview(h)
+
+    records = _events(app_records, "narration_delivered")
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.INFO
+    assert isinstance(reply, VoiceNote)
+    extra = app_records.extra_of(record)
+    assert extra["chat_id"] == CHAT
+    assert extra["update_id"] == UPDATE
+    assert extra["word_count"] == SCRIPT.word_count
+    assert extra["duration_seconds"] == pytest.approx(PCM_SAMPLES / 24_000)
+    assert extra["byte_size"] == len(reply.data)
+
+
+async def test_a_synthesis_failure_returns_the_narration_verbatim_not_generic_failure(
+    tmp_path: Path,
+) -> None:
+    """R3.2/R3.4: a TTS failure degrades to text; it never reaches `_respond`."""
+    failure = GeminiUnavailableError(
+        stage=Stage.NARRATOR,
+        reason="the request timed out",
+        error_type="ReadTimeout",
+        error_code=None,
+    )
+    h = _harness(tmp_path, _happy_replies(), synth_error=failure)
+
+    reply = await _finish_interview(h)
+
+    assert reply == SCRIPT.text
+    assert reply != GENERIC_FAILURE
+    assert len(h.client.synth_calls) == 1
+    assert h.client.synth_calls[0]["text"] == SCRIPT.text
+    assert h.phase() is Phase.SCRIPTED
+    assert h.state().script == SCRIPT
+
+
+async def test_a_synthesis_failure_is_logged_at_warning_as_synthesis(
+    tmp_path: Path, app_records: LogRecorder
+) -> None:
+    """R3.2: `narration_voice_failed` names synthesis, and renders no `str(exc)`."""
+    failure = GeminiUnavailableError(
+        stage=Stage.NARRATOR,
+        reason="the request timed out",
+        error_type="ReadTimeout",
+        error_code=None,
+    )
+    h = _harness(tmp_path, _happy_replies(), synth_error=failure)
+
+    await _finish_interview(h)
+
+    records = _events(app_records, "narration_voice_failed")
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.WARNING
+    extra = app_records.extra_of(record)
+    assert extra["chat_id"] == CHAT
+    assert extra["update_id"] == UPDATE
+    assert extra["reason"] == "synthesis"
+    assert extra["error_type"] == "GeminiUnavailableError"
+    assert str(failure) not in record.getMessage()
+
+
+async def test_an_encoding_failure_returns_the_narration_verbatim_not_generic_failure(
+    tmp_path: Path,
+) -> None:
+    """R3.2/R3.4: our encoder failing is a degradation, never a step failure."""
+    h = _harness(tmp_path, _happy_replies(), synth_audio=TOO_SHORT_AUDIO)
+
+    reply = await _finish_interview(h)
+
+    assert reply == SCRIPT.text
+    assert reply != GENERIC_FAILURE
+    assert len(h.client.synth_calls) == 1
+    assert h.phase() is Phase.SCRIPTED
+    assert h.state().script == SCRIPT
+
+
+async def test_an_encoding_failure_is_logged_at_warning_as_encoding(
+    tmp_path: Path, app_records: LogRecorder
+) -> None:
+    """R3.2: `narration_voice_failed` names encoding, not synthesis."""
+    h = _harness(tmp_path, _happy_replies(), synth_audio=TOO_SHORT_AUDIO)
+
+    await _finish_interview(h)
+
+    records = _events(app_records, "narration_voice_failed")
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.WARNING
+    extra = app_records.extra_of(record)
+    assert extra["chat_id"] == CHAT
+    assert extra["update_id"] == UPDATE
+    assert extra["reason"] == "encoding"
+    assert extra["error_type"] == "NarratorError"
+
+
+async def test_the_session_is_completed_and_saved_before_synthesis_is_attempted(
+    tmp_path: Path,
+) -> None:
+    """D6: the delivery is attempted only after the interview is finished."""
+    failure = GeminiUnavailableError(
+        stage=Stage.NARRATOR,
+        reason="the request timed out",
+        error_type="ReadTimeout",
+        error_code=None,
+    )
+    h = _harness(tmp_path, _happy_replies(), synth_error=failure)
+
+    await _finish_interview(h)
+
+    stored = h.sessions.load(CHAT, update_id=UPDATE)
+    assert stored.phase is Phase.SCRIPTED
+    assert stored.script == SCRIPT
+    assert stored.pending_question is None
+    # The synthesis *was* attempted, after the save: the fallback is a real
+    # degradation, not the row never trying.
+    assert len(h.client.synth_calls) == 1

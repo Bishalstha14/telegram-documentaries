@@ -6,8 +6,11 @@ There is deliberately **no per-phase handler**. There is no per-phase behaviour 
 the phase is a field on the session, and the table that reads it lives in
 :mod:`telegram_documentaries.pipeline`. Each handler does exactly three things:
 parse the update through :meth:`InboundUpdate.from_telegram`, hand it to
-``pipeline.handle_*``, and send the single string that comes back. One send per
-update, always.
+``pipeline.handle_*``, and send the single reply that comes back. That reply is
+now one of two shapes: plain text, or a :class:`VoiceNote` the adapter uploads
+as a voice note. One *reply* per update, always - never two sends. If the voice
+upload fails, the note's own ``fallback_text`` is sent as the one reply instead;
+the failed upload is not retried.
 
 Four rules, in order of how much they cost to get wrong:
 
@@ -45,6 +48,7 @@ Two smaller decisions worth stating:
 
 from __future__ import annotations
 
+import io
 from typing import TypeAlias
 
 from telegram import Bot, File, Update
@@ -63,6 +67,7 @@ from telegram_documentaries.contracts import (
     InboundUpdate,
     InvalidInboundUpdateError,
     PhotoAttachment,
+    VoiceNote,
 )
 from telegram_documentaries.pipeline import ConversationPipeline
 
@@ -139,6 +144,26 @@ async def _send(chat_id: int, update_id: int, context: _Context, text: str) -> N
     await context.bot.send_message(chat_id=chat_id, text=text)
 
 
+@observability.logged("voice_note_sent")
+async def _send_voice(
+    chat_id: int, update_id: int, context: _Context, note: VoiceNote
+) -> None:
+    """Upload one voice note and time the call (R4.2).
+
+    The parameter names are the point, exactly as for :func:`_send`:
+    `observability.logged` reads `chat_id` and `update_id` off the call by name,
+    so every `voice_note_sent` record carries both correlation ids plus
+    `duration_ms`.
+
+    The bytes are wrapped in `io.BytesIO` because Telegram rejects a bare
+    `bytes` for a filename-bearing upload. The note is **bare** - no caption, no
+    duplicated text (D1). If the upload raises, the decorator logs the traceback
+    and re-raises; :func:`_dispatch` catches that and sends the note's own
+    `fallback_text`, so the narration still arrives (R4.3).
+    """
+    await context.bot.send_voice(chat_id=chat_id, voice=io.BytesIO(note.data))
+
+
 async def _dispatch(
     update: Update, context: _Context, *, entry: str
 ) -> None:
@@ -195,9 +220,40 @@ async def _dispatch(
     else:
         reply = await pipeline.handle_message(inbound)
 
-    await _send(
-        chat_id=inbound.chat_id, update_id=inbound.update_id, context=context, text=reply
-    )
+    # One reply per update, in one of two shapes (R4.1). A `VoiceNote` is
+    # uploaded; if that upload fails the note's own text is sent instead - the
+    # same single reply, delivered over the other transport (R4.3, D9/D10). The
+    # failed upload is never retried; a different transport is used.
+    if isinstance(reply, VoiceNote):
+        try:
+            await _send_voice(
+                chat_id=inbound.chat_id,
+                update_id=inbound.update_id,
+                context=context,
+                note=reply,
+            )
+        except Exception as exc:
+            logger.warning(
+                "voice_note_send_failed",
+                extra={
+                    "event": "voice_note_send_failed",
+                    "chat_id": inbound.chat_id,
+                    "update_id": inbound.update_id,
+                    # Class-name only: `str(exc)` may carry the payload and is
+                    # never rendered into a record (R4.3).
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await _send(
+                chat_id=inbound.chat_id,
+                update_id=inbound.update_id,
+                context=context,
+                text=reply.fallback_text,
+            )
+    else:
+        await _send(
+            chat_id=inbound.chat_id, update_id=inbound.update_id, context=context, text=reply
+        )
 
 
 def _pipeline(context: _Context) -> ConversationPipeline | None:

@@ -19,6 +19,7 @@ token used to build an application is the fictional one from `conftest`.
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 from typing import Any
@@ -30,6 +31,7 @@ from telegram import Message
 from telegram.error import NetworkError
 
 from telegram_documentaries import bot
+from telegram_documentaries.contracts import VoiceNote
 from telegram_documentaries.pipeline import WELCOME
 
 # `conftest`'s doubles are intentionally loose and `tests/` sits outside mypy's
@@ -79,6 +81,9 @@ class ExplodingTelegramBot(FakeTelegramBot):
         self.error = error
 
     async def send_message(self, *, chat_id: int, text: str, **kwargs: Any) -> dict[str, Any]:
+        raise self.error
+
+    async def send_voice(self, *, chat_id: int, voice: Any, **kwargs: Any) -> dict[str, Any]:
         raise self.error
 
 
@@ -576,3 +581,147 @@ def test_the_reply_text_constants_carry_no_credential() -> None:
         pipeline_module.SCRIPT_FAILED,
     ):
         assert re.search(r"\d{5,}:[\w-]{20,}", text) is None, text
+
+
+# --------------------------------------------------------------------------
+# R4: a `VoiceNote` reply leaves through `send_voice`, text falls back to
+# `send_message` (task group 7)
+# --------------------------------------------------------------------------
+
+#: The narration carried inside the note. The adapter must be able to send it as
+#: text without knowing anything about the conversation.
+VOICE_FALLBACK_TEXT = "The narration, as words."
+
+
+def _a_voice_note(fallback_text: str = VOICE_FALLBACK_TEXT) -> VoiceNote:
+    """A well-formed note: `ID3` head, `audio/mpeg`, positive duration."""
+    return VoiceNote(
+        data=b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 64,
+        mime_type="audio/mpeg",
+        duration_seconds=1.5,
+        fallback_text=fallback_text,
+    )
+
+
+class VoiceRecordingBot(FakeTelegramBot):
+    """Records `send_voice` calls alongside `send_message` calls."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent_voice: list[dict[str, Any]] = []
+
+    async def send_voice(self, *, chat_id: int, voice: Any, **kwargs: Any) -> dict[str, Any]:
+        """Stand in for `telegram.Bot.send_voice`."""
+        self.sent_voice.append({"chat_id": chat_id, "voice": voice, **kwargs})
+        return {"message_id": len(self.sent_voice)}
+
+
+class VoiceFailingBot(VoiceRecordingBot):
+    """A bot whose voice upload fails, the way the Telegram API can fail."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+        self.voice_attempts = 0
+
+    async def send_voice(self, *, chat_id: int, voice: Any, **kwargs: Any) -> dict[str, Any]:
+        self.voice_attempts += 1
+        raise self.error
+
+
+class FixedReplyPipeline:
+    """A hub stub that hands back one fixed reply.
+
+    Used only where the test is about the *adapter's* handling of a reply shape,
+    not about the decision table: a stub makes "a `VoiceNote` arrived" an input
+    the test controls directly.
+    """
+
+    def __init__(self, reply: Any) -> None:
+        self.reply = reply
+
+    async def handle_start(self, inbound: Any) -> Any:
+        return self.reply
+
+    async def handle_restart(self, inbound: Any) -> Any:
+        return self.reply
+
+    async def handle_message(self, inbound: Any) -> Any:
+        return self.reply
+
+
+def _voice_context(note: VoiceNote, bot: FakeTelegramBot | None = None) -> FakeContext:
+    chosen_bot = bot if bot is not None else VoiceRecordingBot()
+    return FakeContext(chosen_bot, pipeline=FixedReplyPipeline(note))
+
+
+async def test_a_voice_note_reply_is_sent_as_a_bare_voice_note(
+    start_update: UpdateFactory,
+) -> None:
+    """R4.2: the note is uploaded with no caption and no duplicated text."""
+    note = _a_voice_note()
+    context = _voice_context(note)
+
+    await bot.on_start(start_update(), context)
+
+    assert context.bot.sent == [], "a voice note must not also produce a text message"
+    assert len(context.bot.sent_voice) == 1
+    sent = context.bot.sent_voice[0]
+    assert sent["chat_id"] == CHAT_ID
+    assert "caption" not in sent, "the voice note is bare (D1)"
+    assert isinstance(sent["voice"], io.BytesIO), "Telegram rejects a bare bytes upload"
+    assert sent["voice"].getvalue() == note.data
+
+
+async def test_a_successful_voice_send_is_logged_with_its_duration(
+    start_update: UpdateFactory,
+    app_records: LogRecords,
+) -> None:
+    """R4.1: `voice_note_sent` carries the correlation stamps and the duration."""
+    context = _voice_context(_a_voice_note())
+
+    await bot.on_start(start_update(), context)
+
+    events = {
+        app_records.extra_of(record).get("event"): app_records.extra_of(record)
+        for record in app_records.records
+    }
+    sent = events["voice_note_sent"]
+    assert sent["chat_id"] == CHAT_ID
+    assert sent["update_id"] == UPDATE_ID
+    assert sent["duration_ms"] >= 0
+
+
+async def test_a_failed_voice_send_falls_back_to_the_narration_text(
+    start_update: UpdateFactory,
+    app_records: LogRecords,
+) -> None:
+    """R4.3: a failed upload warns, then delivers the note's text once.
+
+    `voice_attempts == 1` is the no-retry assertion (D10): the adapter switches
+    transport rather than repeating the one that just failed.
+    """
+    failure = NetworkError("voice upload failed")
+    context = _voice_context(_a_voice_note(), VoiceFailingBot(failure))
+
+    await bot.on_start(start_update(), context)
+
+    assert context.bot.voice_attempts == 1, "the failed voice send must not be retried"
+    assert len(context.bot.sent) == 1, "exactly one message reaches the chat"
+    assert context.bot.sent[0]["chat_id"] == CHAT_ID
+    assert context.bot.sent[0]["text"] == VOICE_FALLBACK_TEXT
+
+    warnings = app_records.at_level(logging.WARNING)
+    failed = [
+        record
+        for record in warnings
+        if app_records.extra_of(record).get("event") == "voice_note_send_failed"
+    ]
+    assert len(failed) == 1
+    extra = app_records.extra_of(failed[0])
+    assert extra["chat_id"] == CHAT_ID
+    assert extra["update_id"] == UPDATE_ID
+    assert extra["error_type"] == "NetworkError"
+    assert "voice upload failed" not in _everything_visible(failed[0]), (
+        "an exception's message must never be rendered into a log record"
+    )

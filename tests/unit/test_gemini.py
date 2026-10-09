@@ -1524,6 +1524,202 @@ def test_the_gemini_boundary_is_the_only_place_genai_is_imported() -> None:
     assert offenders == []
 
 
+# ==========================================================================
+# R1.4 - R1.7: `synthesize` on the client.
+# ==========================================================================
+
+
+def _audio_reply(
+    *,
+    data: bytes = PCM_AUDIO,
+    mime_type: str = AUDIO_MIME,
+) -> types.GenerateContentResponse:
+    """A canned TTS reply: one candidate, one inline-data audio part."""
+    return _reply(parts=[types.Part(inline_data=types.Blob(data=data, mime_type=mime_type))])
+
+
+async def _synthesize(
+    client: GenAiGeminiClient,
+    *,
+    text: str = "Read this aloud.",
+    voice: str = "Kore",
+    chat_id: int = -1001234567890,
+    update_id: int = 4242,
+) -> gemini.SynthesizedAudio:
+    """Drive the second protocol method the way the Narrator would."""
+    audio = await client.synthesize(text, voice, chat_id, update_id)
+    assert isinstance(audio, gemini.SynthesizedAudio), (
+        "synthesize must return validated audio"
+    )
+    return audio
+
+
+def test_the_gemini_client_protocol_now_requires_synthesize() -> None:
+    """R1.4: the `runtime_checkable` guard keeps `GenAiGeminiClient` honest.
+
+    A double that still implements only `generate` must no longer satisfy the
+    port, so a signature the production client forgets is a failure rather than
+    a surprise on the first voice note.
+    """
+
+    class _GenerateOnly:
+        async def generate(
+            self,
+            request: Any,
+            response_schema: Any,
+            chat_id: int,
+            update_id: int,
+        ) -> Any: ...
+
+    assert not isinstance(_GenerateOnly(), gemini.GeminiClient)
+    assert isinstance(_client(FakeTransport(_audio_reply())), gemini.GeminiClient)
+
+
+async def test_synthesize_returns_the_validated_audio() -> None:
+    """The happy path: one inline-data audio part becomes a `SynthesizedAudio`."""
+    transport = FakeTransport(_audio_reply())
+
+    audio = await _synthesize(_client(transport))
+
+    assert audio.data == PCM_AUDIO
+    assert audio.sample_rate == 24_000
+    assert audio.channels == 1
+    assert audio.duration_seconds == pytest.approx(576 / 24_000)
+
+
+async def test_synthesize_uses_the_tts_model_not_the_text_model() -> None:
+    """R1.4/A.1: the speech model is a distinct constant from `MODEL_ID`."""
+    transport = FakeTransport(_audio_reply())
+
+    await _synthesize(_client(transport))
+
+    assert transport.calls[0].model == gemini.TTS_MODEL_ID
+    assert gemini.TTS_MODEL_ID == "gemini-3.1-flash-tts-preview"
+    assert gemini.TTS_MODEL_ID != gemini.MODEL_ID
+
+
+async def test_synthesize_asks_for_text_and_audio_without_a_schema() -> None:
+    """R1.7: no `response_schema`, no `response_mime_type` - audio is not JSON."""
+    transport = FakeTransport(_audio_reply())
+
+    await _synthesize(_client(transport), voice="Fenrir")
+
+    config = transport.calls[0].config
+    assert config.response_modalities == ["TEXT", "AUDIO"]
+    assert config.response_schema is None
+    assert config.response_mime_type is None
+    assert config.speech_config is not None
+    voice_config = config.speech_config.voice_config
+    assert voice_config is not None
+    assert voice_config.prebuilt_voice_config is not None
+    assert voice_config.prebuilt_voice_config.voice_name == "Fenrir"
+
+
+_AUDIO_REJECTIONS = [
+    pytest.param(_reply(candidates=[]), "no candidates", id="no_candidates"),
+    pytest.param(_reply(candidates=[types.Candidate()]), "no content", id="no_content"),
+    pytest.param(
+        _reply(parts=[types.Part(text="I cannot read that aloud.")]),
+        "no audio part",
+        id="text_part_not_audio",
+    ),
+    pytest.param(_audio_reply(mime_type="audio/mpeg"), "not audio/l16", id="wrong_mime"),
+    pytest.param(_audio_reply(data=b""), "empty", id="empty_data"),
+    pytest.param(
+        _audio_reply(mime_type="audio/l16; rate=fast; channels=1"),
+        "non-integer sample rate",
+        id="rate_not_int",
+    ),
+]
+
+
+@pytest.mark.parametrize(("reply", "reason"), _AUDIO_REJECTIONS)
+async def test_synthesize_rejects_a_bad_audio_reply_with_a_fixed_reason(
+    reply: types.GenerateContentResponse,
+    reason: str,
+) -> None:
+    """R1.6: a fixed reason at `Stage.NARRATOR`, and never the payload."""
+    transport = FakeTransport(reply)
+
+    with pytest.raises(GeminiResponseError) as excinfo:
+        await _synthesize(_client(transport))
+
+    assert excinfo.value.stage is Stage.NARRATOR
+    assert reason in excinfo.value.reason
+
+
+async def test_synthesize_maps_a_server_error_to_unavailable() -> None:
+    """R1.4: the same taxonomy `generate` uses, not a re-derivation."""
+    transport = FakeTransport(error=errors.ServerError(503, {"error": {"message": "overloaded"}}))
+
+    with pytest.raises(GeminiUnavailableError):
+        await _synthesize(_client(transport))
+
+
+async def test_synthesize_maps_a_client_error_to_a_response_error() -> None:
+    transport = FakeTransport(error=errors.ClientError(400, {"error": {"message": "bad request"}}))
+
+    with pytest.raises(GeminiResponseError) as excinfo:
+        await _synthesize(_client(transport))
+
+    assert excinfo.value.stage is Stage.NARRATOR
+
+
+async def test_synthesize_is_logged_as_a_gemini_call_for_the_narrator(
+    app_records: LogRecords,
+) -> None:
+    """R1.5: the same `gemini_call` record shape, with the TTS stage and model."""
+    transport = FakeTransport(_audio_reply())
+
+    await _synthesize(_client(transport), chat_id=-42, update_id=7)
+
+    calls = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_call"
+    ]
+    assert calls, "a synthesis call must be decorated"
+    context = calls[0]
+    assert context["stage"] == "narrator"
+    assert context["model"] == gemini.TTS_MODEL_ID == "gemini-3.1-flash-tts-preview"
+    assert context["chat_id"] == -42
+    assert context["update_id"] == 7
+    assert isinstance(context["duration_ms"], float)
+
+
+async def test_synthesize_failures_never_log_the_api_key(app_records: LogRecords) -> None:
+    """R1.7: the new seam is swept for the same leak the other one is."""
+    failures = [
+        httpx.ReadTimeout("timed out"),
+        _api_error_with_body(503),
+        errors.ClientError(400, {"error": {"message": "bad request"}}),
+    ]
+
+    for failure in failures:
+        app_records.records.clear()
+        client = _client(FakeTransport(error=failure))
+
+        with pytest.raises(gemini.GeminiError) as excinfo:
+            await _synthesize(client)
+
+        assert app_records.records, "a failure must be logged, never silent"
+        rendered = _rendered(app_records.records)
+        assert API_KEY not in rendered
+        assert "SUPERSECRET" not in rendered
+        assert API_KEY not in f"{excinfo.value!r}{excinfo.value!s}"
+
+
+async def test_a_successful_synthesis_never_logs_the_api_key(
+    app_records: LogRecords,
+) -> None:
+    transport = FakeTransport(_audio_reply())
+
+    await _synthesize(_client(transport))
+
+    assert app_records.records, "a call must be logged, never silent"
+    assert API_KEY not in _rendered(app_records.records)
+
+
 # --------------------------------------------------------------------------
 # Rendering helper: the log output a human would actually see.
 # --------------------------------------------------------------------------

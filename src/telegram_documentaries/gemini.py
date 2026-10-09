@@ -56,6 +56,7 @@ from telegram_documentaries.contracts import validation_error_fields
 __all__ = [
     "GEMINI_TIMEOUT_MS",
     "MODEL_ID",
+    "TTS_MODEL_ID",
     "GeminiClient",
     "GeminiError",
     "GeminiRequest",
@@ -76,6 +77,11 @@ logger = observability.get_logger("gemini")
 #: It is deliberately *not* a `Settings` field - it needs to be bounded and
 #: shared, not tunable (D9).
 MODEL_ID = "gemini-3.1-flash-lite"
+
+#: R1.4/A.1: the speech model, distinct from the text model. It returns raw PCM
+#: (`audio/l16`) and nothing else - every non-default `response_mime_type`
+#: returns HTTP 400 - so it is named once here rather than inline at the call.
+TTS_MODEL_ID = "gemini-3.1-flash-tts-preview"
 
 #: R1.5: every call is bounded at 20 seconds through `types.HttpOptions`, never
 #: at the SDK's own default, which is far longer than a user will wait.
@@ -336,11 +342,15 @@ class GeminiResponseError(GeminiError):
 
 @runtime_checkable
 class GeminiClient(Protocol):
-    """The one method every stage sees (R1.2).
+    """The two methods the application sees: text generation and speech (D-V2).
+
+    `generate` is schema-bound JSON; `synthesize` is audio, so it cannot travel
+    through `generate`'s `response_schema` without lying about its shape. They
+    share the injection seam and the transport - one object, two methods.
 
     A `Protocol`, not a class, so a test injects a fake and never touches a
-    socket. `runtime_checkable` makes `isinstance` a real guard: a change to this
-    signature that `GenAiGeminiClient` does not follow is a test failure.
+    socket. `runtime_checkable` makes `isinstance` a real guard: a change to
+    either signature that `GenAiGeminiClient` does not follow is a test failure.
 
     `chat_id` and `update_id` are carried purely for logging correlation - they
     are read by name by the `@logged` decoration on the implementation.
@@ -353,6 +363,14 @@ class GeminiClient(Protocol):
         chat_id: int,
         update_id: int,
     ) -> _SchemaT: ...
+
+    async def synthesize(
+        self,
+        text: str,
+        voice: VoiceName,
+        chat_id: int,
+        update_id: int,
+    ) -> SynthesizedAudio: ...
 
 
 class GeminiTransport(Protocol):
@@ -408,31 +426,27 @@ class _GenAiTransport:
         )
 
 
-async def _generate_content(
+async def _call_transport(
     transport: GeminiTransport,
-    request: GeminiRequest,
-    response_schema: type[_SchemaT],
+    *,
+    model: str,
+    contents: types.Content,
+    config: types.GenerateContentConfig,
+    stage: Stage,
     chat_id: int,
     update_id: int,
-) -> _SchemaT:
-    """Make the call, map every failure onto the taxonomy, parse strictly.
+) -> types.GenerateContentResponse:
+    """Make the HTTP call, mapping every failure onto the taxonomy (R1.6).
 
-    This is the function `@logged` wraps, so it must never let an exception whose
-    `str()` is unsafe escape to the decorator's `exc_info` rendering.
+    The one try/except in the project that knows how ``google.genai`` fails,
+    shared by :func:`_generate_content` and :func:`_synthesize` so the
+    classification is written once. Nothing here renders ``str(exc)``; the
+    leaky originals are chained with ``from None``.
     """
-    stage = request.stage
-    config = types.GenerateContentConfig(
-        system_instruction=request.system_instruction,
-        response_mime_type=_JSON_MIME_TYPE,
-        # The single place a response schema is serialised for the wire; the
-        # helper's docstring explains why the strip is not optional.
-        response_schema=_strip_additional_properties(response_schema.model_json_schema()),
-    )
-
     try:
-        raw = await transport.generate_content(
-            model=MODEL_ID,
-            contents=_contents_of(request),
+        return await transport.generate_content(
+            model=model,
+            contents=contents,
             config=config,
         )
     except httpx.TimeoutException as exc:
@@ -476,6 +490,36 @@ async def _generate_content(
             update_id=update_id,
         ) from None
 
+
+async def _generate_content(
+    transport: GeminiTransport,
+    request: GeminiRequest,
+    response_schema: type[_SchemaT],
+    chat_id: int,
+    update_id: int,
+) -> _SchemaT:
+    """Make the call, map every failure onto the taxonomy, parse strictly.
+
+    This is the function `@logged` wraps, so it must never let an exception whose
+    `str()` is unsafe escape to the decorator's `exc_info` rendering.
+    """
+    stage = request.stage
+    config = types.GenerateContentConfig(
+        system_instruction=request.system_instruction,
+        response_mime_type=_JSON_MIME_TYPE,
+        # The single place a response schema is serialised for the wire; the
+        # helper's docstring explains why the strip is not optional.
+        response_schema=_strip_additional_properties(response_schema.model_json_schema()),
+    )
+    raw = await _call_transport(
+        transport,
+        model=MODEL_ID,
+        contents=_contents_of(request),
+        config=config,
+        stage=stage,
+        chat_id=chat_id,
+        update_id=update_id,
+    )
     return _typed_reply(stage, raw, response_schema, chat_id, update_id)
 
 
@@ -508,6 +552,66 @@ def _stage_call(stage: Stage) -> _StageCall:
 
 
 _STAGE_CALLS: dict[Stage, _StageCall] = {stage: _stage_call(stage) for stage in Stage}
+
+
+async def _synthesize(
+    transport: GeminiTransport,
+    text: str,
+    voice: VoiceName,
+    chat_id: int,
+    update_id: int,
+) -> SynthesizedAudio:
+    """Synthesize `text` in `voice`, or raise one of the two typed errors (R1.4).
+
+    This is the function `@logged` wraps, so it must never let an exception whose
+    `str()` is unsafe escape to the decorator's `exc_info` rendering. It reuses
+    :func:`_call_transport`, so it inherits the same error classification as
+    :func:`_generate_content` rather than re-deriving it.
+    """
+    stage = Stage.NARRATOR
+    request = SynthesisRequest(text=text, voice=voice)
+    raw = await _call_transport(
+        transport,
+        model=TTS_MODEL_ID,
+        contents=_synthesis_contents(request),
+        config=_synthesis_config(request),
+        stage=stage,
+        chat_id=chat_id,
+        update_id=update_id,
+    )
+    return _synthesized_audio(stage, raw, chat_id, update_id)
+
+
+class _SynthesizeCall(Protocol):
+    """The narrator's decorated entry point, bound to the TTS stage and model."""
+
+    def __call__(
+        self,
+        transport: GeminiTransport,
+        text: str,
+        voice: VoiceName,
+        chat_id: int,
+        update_id: int,
+    ) -> Awaitable[SynthesizedAudio]: ...
+
+
+def _synthesize_call() -> _SynthesizeCall:
+    """Decorate synthesis with the narrator stage and TTS model as static context.
+
+    The counterpart of :func:`_stage_call` for the one call that is not
+    schema-bound. It binds the same ``gemini_call`` event with the same record
+    shape - `event`, `chat_id`, `update_id`, `duration_ms` and the static
+    `stage`/`model` - so a narrator record is indistinguishable in form from a
+    `generate` record (R1.5).
+    """
+    decorated = observability.logged(
+        "gemini_call",
+        extra={"stage": Stage.NARRATOR.value, "model": TTS_MODEL_ID},
+    )(_synthesize)
+    return cast("_SynthesizeCall", decorated)
+
+
+_SYNTHESIZE_CALL: _SynthesizeCall = _synthesize_call()
 
 
 class GenAiGeminiClient:
@@ -573,6 +677,34 @@ class GenAiGeminiClient:
         """
         call = _STAGE_CALLS[request.stage]
         return await call(self._transport, request, response_schema, chat_id, update_id)
+
+    async def synthesize(
+        self,
+        text: str,
+        voice: VoiceName,
+        chat_id: int,
+        update_id: int,
+    ) -> SynthesizedAudio:
+        """Return the validated PCM, or raise one of the two typed errors (R1.4).
+
+        Args:
+            text: The narration to read aloud.
+            voice: The voice to read it in, from the verified set (D2).
+            chat_id: Telegram chat id, for log correlation only.
+            update_id: Telegram update id, for log correlation only.
+
+        Returns:
+            The validated raw audio, with its sample rate and duration parsed
+            and derived.
+
+        Raises:
+            GeminiUnavailableError: The call did not produce a usable answer for
+                environmental reasons - a timeout, a transport failure, a 5xx or
+                a 429.
+            GeminiResponseError: A reply arrived and could not be used - no
+                candidates, no content, no audio part, or a malformed payload.
+        """
+        return await _SYNTHESIZE_CALL(self._transport, text, voice, chat_id, update_id)
 
 
 # --------------------------------------------------------------------------
@@ -650,6 +782,30 @@ def _contents_of(request: GeminiRequest) -> types.Content:
         )
     parts.append(types.Part.from_text(text=request.prompt))
     return types.Content(role="user", parts=parts)
+
+
+def _synthesis_contents(request: SynthesisRequest) -> types.Content:
+    """Build the single user turn: the narration to read aloud, and nothing else."""
+    return types.Content(role="user", parts=[types.Part.from_text(text=request.text)])
+
+
+def _synthesis_config(request: SynthesisRequest) -> types.GenerateContentConfig:
+    """The TTS request config: text and audio out, a named voice (R1.7).
+
+    Deliberately carries **no** ``response_mime_type`` and **no**
+    ``response_schema``. Every non-default mime type was verified to return HTTP
+    400 ``INVALID_ARGUMENT``, so the model's own ``audio/l16`` is the only
+    working format; and audio is not JSON, so :func:`_typed_reply` is not on this
+    path and :class:`SynthesizedAudio`'s own validation is (R1.3).
+    """
+    return types.GenerateContentConfig(
+        response_modalities=["TEXT", "AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=request.voice)
+            )
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -782,6 +938,88 @@ def _text_part_of(part: object) -> str | None:
 def _is_max_tokens(finish_reason: object) -> bool:
     """True for the `MAX_TOKENS` enum member or its plain string form."""
     return getattr(finish_reason, "value", finish_reason) == types.FinishReason.MAX_TOKENS.value
+
+
+def _synthesized_audio(
+    stage: Stage,
+    raw: types.GenerateContentResponse,
+    chat_id: int,
+    update_id: int,
+) -> SynthesizedAudio:
+    """Validate the one audio part, or reject the reply (R1.6).
+
+    The rejections are explicit and ordered: no candidates, no content, no audio
+    part, then the payload's own validation (mime, rate, channels, data length).
+    The payload is never rendered - a malformed one is reported as a fixed
+    reason chosen from the field names the validator reported.
+    """
+    candidate = _candidate_of(stage, raw, chat_id, update_id)
+    part = _audio_part_of(stage, candidate, chat_id, update_id)
+    blob = getattr(part, "inline_data", None)
+    data = getattr(blob, "data", None)
+    mime_type = getattr(blob, "mime_type", None)
+
+    try:
+        return SynthesizedAudio(data=data or b"", mime_type=mime_type or "")
+    except ValidationError as exc:
+        raise _reject(
+            stage,
+            _audio_payload_reason(exc),
+            chat_id=chat_id,
+            update_id=update_id,
+        ) from None
+
+
+def _audio_part_of(
+    stage: Stage,
+    candidate: types.Candidate,
+    chat_id: int,
+    update_id: int,
+) -> types.Part:
+    """R1.6: the one inline-data audio part, or a fixed-reason rejection.
+
+    A candidate with no content and a candidate whose parts carry text are
+    distinct defects and are named as such, rather than collapsed into "no
+    audio".
+    """
+    content = getattr(candidate, "content", None)
+    if content is None:
+        raise _reject(
+            stage,
+            "the reply carried no content",
+            chat_id=chat_id,
+            update_id=update_id,
+        )
+    parts = getattr(content, "parts", None) or ()
+    for part in parts:
+        if getattr(part, "inline_data", None) is not None:
+            return cast("types.Part", part)
+    raise _reject(
+        stage,
+        "the reply carried no audio part",
+        chat_id=chat_id,
+        update_id=update_id,
+    )
+
+
+def _audio_payload_reason(exc: ValidationError) -> str:
+    """A fixed reason for a malformed audio payload, from field names only.
+
+    ``str(exc)`` would render ``input_value`` - the audio bytes or the
+    narration - so only the offending field *names* are read. The checks are
+    ordered so the most specific defect is reported first.
+    """
+    fields = set(validation_error_fields(exc))
+    for field, reason in (
+        ("data", "the audio payload is empty or not whole s16le frames"),
+        ("media_type", "the audio payload is not audio/l16"),
+        ("rate", "the audio payload declares a non-integer sample rate"),
+        ("channels", "the audio payload is not mono"),
+        ("mime_type", "the audio payload declares an unexpected mime type"),
+    ):
+        if field in fields:
+            return reason
+    return "the audio payload is not usable audio"
 
 
 # --------------------------------------------------------------------------

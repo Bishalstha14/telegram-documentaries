@@ -2,14 +2,23 @@
 
 Everything the bot does is a row here. `bot.py` parses a Telegram update into an
 :class:`~telegram_documentaries.contracts.InboundUpdate`, hands it over, and
-sends back the single string this module returns - so the branch lives in the
+sends back the single reply this module returns - so the branch lives in the
 domain layer, where it can be tested with no Telegram, no Gemini and no network
 (R9.2).
 
 Four rules govern the table:
 
-**One send per update (R9.3).** `handle_*` returns one `str`, always. The
-adapter sends it and nothing else.
+**One send per update (R9.3).** `handle_*` returns one `Reply`, always. Every
+row but one returns a `str`; the finished narration may return a
+:class:`~telegram_documentaries.contracts.VoiceNote`. The adapter sends that one
+object and nothing else.
+
+**The reply type widened (recorded deviation D4).** The text slice's R9.3 said
+`str`. The script row now delivers the narration as audio, and a voice note is
+not a string, so the type is
+`Reply = str | VoiceNote` (:mod:`~telegram_documentaries.contracts`). The intent
+- exactly one reply per update - is unchanged; only the type widened, and every
+other row still returns a `str`.
 
 **Nothing is raised into the user's flow (R9.5).** Every domain error - Gemini,
 state transition, media - is caught at this boundary, logged, and answered with
@@ -29,16 +38,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from telegram_documentaries import bouncer, interviewer, media, scripter, state
+from telegram_documentaries import bouncer, interviewer, media, narrator, scripter, state
 from telegram_documentaries.contracts import (
     InboundUpdate,
     PhotoAttachment,
+    Reply,
     UnsupportedAttachment,
 )
 from telegram_documentaries.gemini import (
     GeminiClient,
     GeminiError,
 )
+from telegram_documentaries.narrator import NarratorError
 from telegram_documentaries.observability import get_logger
 
 if TYPE_CHECKING:
@@ -60,13 +71,14 @@ PHOTO_MIME_TYPE = "image/jpeg"
 
 
 #: The `/start` output (D10). Replaces `bot.GREETING`, whose claim that the
-#: pipeline "is not built yet" is no longer true - and it must promise only what
-#: exists, so the hybrid image and the voice note are not mentioned.
+#: pipeline "is not built yet" is no longer true. It promises the voice note,
+#: which now exists (R3.6), and only that: the hybrid image is still a separate,
+#: unbuilt phase, so it is not mentioned.
 WELCOME = (
     "Welcome to Telegram Documentaries.\n\n"
     "Send me a portrait photo of a person and I will interview them for a "
     "wildlife documentary: five to seven questions, one at a time. When the "
-    "interview is finished the narration arrives as a message.\n\n"
+    "interview is finished the narration arrives as a voice note.\n\n"
     "Send /restart at any time to start over."
 )
 
@@ -154,7 +166,7 @@ class ConversationPipeline:
 
     # -- commands -----------------------------------------------------------
 
-    async def handle_start(self, update: InboundUpdate) -> str:
+    async def handle_start(self, update: InboundUpdate) -> Reply:
         """`/start`: purge state and media, then ask for a portrait photo.
 
         The only row that applies at every phase, and the only one that discards
@@ -162,17 +174,17 @@ class ConversationPipeline:
         """
         return await self._command(update, reason="start")
 
-    async def handle_restart(self, update: InboundUpdate) -> str:
+    async def handle_restart(self, update: InboundUpdate) -> Reply:
         """`/restart`: purge state and media, from any phase (D4)."""
         return await self._command(update, reason="restart")
 
-    async def handle_message(self, update: InboundUpdate) -> str:
+    async def handle_message(self, update: InboundUpdate) -> Reply:
         """Every other update: text, photo, or something unusable (R9.1)."""
         return await self._respond(update)
 
     # -- command rows -------------------------------------------------------
 
-    async def _command(self, update: InboundUpdate, *, reason: str) -> str:
+    async def _command(self, update: InboundUpdate, *, reason: str) -> Reply:
         chat_id, update_id = update.chat_id, update.update_id
 
         try:
@@ -204,7 +216,7 @@ class ConversationPipeline:
 
     # -- the table ----------------------------------------------------------
 
-    async def _respond(self, update: InboundUpdate) -> str:
+    async def _respond(self, update: InboundUpdate) -> Reply:
         chat_id, update_id = update.chat_id, update.update_id
 
         try:
@@ -242,7 +254,7 @@ class ConversationPipeline:
 
     async def _dispatch(
         self, update: InboundUpdate, current: state.SessionState
-    ) -> str:
+    ) -> Reply:
         if update.attachment is None:
             text = update.text or ""
             if not text.strip():
@@ -398,7 +410,7 @@ class ConversationPipeline:
 
     async def _record_answer(
         self, update: InboundUpdate, current: state.SessionState
-    ) -> str:
+    ) -> Reply:
         """Record one answer, then either ask the next question or write the script.
 
         The new state is *not* saved until the step that consumes it succeeds.
@@ -432,7 +444,14 @@ class ConversationPipeline:
 
     async def _write_script(
         self, update: InboundUpdate, answered: state.SessionState
-    ) -> str:
+    ) -> Reply:
+        """Write the narration, finish the session, then try to voice it.
+
+        The order is the contract (D6/R3.1): the session is completed and saved
+        *before* synthesis is attempted, so a TTS failure can never strand an
+        interview mid-question. The narration is written once; only its delivery
+        can degrade, and when it does the user still gets the text (R3.7).
+        """
         chat_id, update_id = update.chat_id, update.update_id
         plan = answered.plan
         if plan is None:
@@ -468,7 +487,44 @@ class ConversationPipeline:
                 "word_count": script.word_count,
             },
         )
-        return script.text
+
+        try:
+            note = await narrator.narrate(
+                self._client,
+                script.text,
+                chat_id=chat_id,
+                update_id=update_id,
+            )
+        except (GeminiError, NarratorError) as exc:
+            # D6: a delivery failure is not a pipeline failure. `_respond` maps
+            # `GeminiError` to `GENERIC_FAILURE`, which is right for a failed
+            # *step* and wrong for a failed *delivery* - the narration exists, so
+            # the user gets it as text. The exception is logged by type, never
+            # rendered: `str(exc)` can carry a payload (R3.2).
+            logger.warning(
+                "narration_voice_failed",
+                extra={
+                    "event": "narration_voice_failed",
+                    "chat_id": chat_id,
+                    "update_id": update_id,
+                    "reason": "synthesis" if isinstance(exc, GeminiError) else "encoding",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return script.text
+
+        logger.info(
+            "narration_delivered",
+            extra={
+                "event": "narration_delivered",
+                "chat_id": chat_id,
+                "update_id": update_id,
+                "word_count": script.word_count,
+                "duration_seconds": note.duration_seconds,
+                "byte_size": len(note.data),
+            },
+        )
+        return note
 
     # -- helpers ------------------------------------------------------------
 

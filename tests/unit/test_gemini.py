@@ -942,6 +942,77 @@ async def test_an_unavailable_error_is_not_rejected_as_a_bad_reply() -> None:
 
 
 # ==========================================================================
+# R1.1 - a 429 is its own failure: a strict refinement of unavailable.
+# ==========================================================================
+
+
+async def test_generate_raises_a_throttled_error_on_a_429() -> None:
+    """R1.1: the throttle has its own type, so a caller can specialise."""
+    transport = FakeTransport(error=errors.ClientError(429, {"error": {"message": "quota"}}))
+
+    with pytest.raises(gemini.GeminiThrottledError):
+        await _generate(_client(transport))
+
+
+def test_the_throttled_error_is_a_strict_refinement_of_unavailable() -> None:
+    """R1.1: every existing `except GeminiUnavailableError` stays correct."""
+    assert issubclass(gemini.GeminiThrottledError, GeminiUnavailableError)
+    assert issubclass(gemini.GeminiThrottledError, gemini.GeminiError)
+    assert not issubclass(GeminiUnavailableError, gemini.GeminiThrottledError)
+
+
+async def test_a_server_error_is_not_the_throttle_type() -> None:
+    """R1.1: a 5xx is a plain outage and must not be conflated with a throttle."""
+    transport = FakeTransport(error=errors.ServerError(500, {"error": {"message": "boom"}}))
+
+    with pytest.raises(GeminiUnavailableError) as excinfo:
+        await _generate(_client(transport))
+
+    assert type(excinfo.value) is GeminiUnavailableError
+    assert not isinstance(excinfo.value, gemini.GeminiThrottledError)
+
+
+async def test_the_throttled_error_carries_the_stage_reason_and_code() -> None:
+    transport = FakeTransport(error=errors.ClientError(429, {"error": {"message": "quota"}}))
+
+    with pytest.raises(gemini.GeminiThrottledError) as excinfo:
+        await _generate(_client(transport), _request(stage=Stage.SCRIPTER))
+
+    error = excinfo.value
+    assert error.stage is Stage.SCRIPTER
+    assert error.error_code == 429
+    assert error.reason
+    assert str(error), "the message must never be empty"
+
+
+async def test_a_throttle_logs_the_throttled_record_without_str_exc(
+    app_records: LogRecords,
+) -> None:
+    """R1.9: `gemini_throttled` names the stage and code, and leaks nothing."""
+    transport = FakeTransport(
+        error=errors.ClientError(
+            429, {"error": {"message": f"quota: {RESPONSE_BODY_SENTINEL}"}}
+        )
+    )
+
+    with pytest.raises(gemini.GeminiThrottledError) as excinfo:
+        await _generate(_client(transport))
+
+    records = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_throttled"
+    ]
+    assert records, "a throttle must be logged, never silent"
+    context = records[0]
+    assert context["stage"] == "bouncer"
+    assert context["error_code"] == 429
+    assert context["error_type"] == "ClientError"
+    assert RESPONSE_BODY_SENTINEL not in _rendered(app_records.records)
+    assert RESPONSE_BODY_SENTINEL not in f"{excinfo.value!s}{excinfo.value!r}"
+
+
+# ==========================================================================
 # R1.7 - no secret, and no response body, ever reaches a log or a message.
 # ==========================================================================
 

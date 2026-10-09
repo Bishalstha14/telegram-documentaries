@@ -62,6 +62,7 @@ __all__ = [
     "GeminiError",
     "GeminiRequest",
     "GeminiResponseError",
+    "GeminiThrottledError",
     "GeminiTransport",
     "GeminiUnavailableError",
     "GenAiGeminiClient",
@@ -328,6 +329,21 @@ class GeminiUnavailableError(GeminiError):
         self.reason = reason
         self.error_type = error_type
         self.error_code = error_code
+
+
+class GeminiThrottledError(GeminiUnavailableError):
+    """The API returned ``429``: a transient throttle, not an outage (R1.1).
+
+    A **subclass** of :class:`GeminiUnavailableError`, so every existing
+    ``except GeminiUnavailableError`` / ``except GeminiError`` that keeps a
+    session for an environmental failure stays correct - including the
+    narrator's degrade-to-text path. It exists only so a caller that cares can
+    tell "we were throttled, try again shortly" apart from "the service is
+    down" and reach for different words (D4).
+
+    Inherits the assembled, leak-free message from its parent; it never carries
+    ``str(exc)`` (R1.7).
+    """
 
 
 class GeminiResponseError(GeminiError):
@@ -1070,16 +1086,20 @@ def _from_api_error(
     chat_id: int | None,
     update_id: int | None,
 ) -> GeminiError:
-    """Classify an `APIError` into unavailable or rejected (R1.6).
+    """Classify an `APIError` into throttled, unavailable or rejected (R1.6).
 
     Only the class name and `code` are read. `exc.details` - the raw response
     body - and `exc.message` are never touched (R1.7).
+
+    The ``429`` branch is split out *ahead* of the server branch (R1.1/D4): a
+    throttle is a strict refinement of "unavailable", so it must be recognised
+    before the broader ``ServerError``/5xx test can swallow it.
     """
     code = _code_of(exc)
-    if (
-        isinstance(exc, genai_errors.ServerError)
-        or code == _THROTTLED_CODE
-        or (code is not None and code >= 500)
+    if code == _THROTTLED_CODE:
+        return _throttled(stage, exc, chat_id, update_id, code=code)
+    if isinstance(exc, genai_errors.ServerError) or (
+        code is not None and code >= 500
     ):
         return _unavailable(
             stage,
@@ -1135,6 +1155,42 @@ def _unavailable(
     return GeminiUnavailableError(
         stage=stage,
         reason=reason,
+        error_type=error_type,
+        error_code=error_code,
+    )
+
+
+def _throttled(
+    stage: Stage,
+    exc: BaseException,
+    chat_id: int | None,
+    update_id: int | None,
+    *,
+    code: int | None = None,
+) -> GeminiThrottledError:
+    """Build and log a throttle, reading only `type(exc)` and `code` (R1.9).
+
+    The record is ``gemini_throttled`` at ERROR - the attempts are spent and the
+    user is about to be told to try again shortly - and carries the class name,
+    stage and code, never ``str(exc)``.
+    """
+    error_type = type(exc).__name__
+    error_code = code if code is not None else _code_of(exc)
+    logger.error(
+        "gemini_throttled",
+        extra={
+            "event": "gemini_throttled",
+            "stage": stage.value,
+            "model": MODEL_ID,
+            "chat_id": chat_id,
+            "update_id": update_id,
+            "error_type": error_type,
+            "error_code": error_code,
+        },
+    )
+    return GeminiThrottledError(
+        stage=stage,
+        reason="the API throttled the request",
         error_type=error_type,
         error_code=error_code,
     )

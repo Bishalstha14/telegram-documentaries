@@ -49,6 +49,13 @@ this project is real — every image-model probe in this session returned it.
   rejected reply are classified and raised on the first attempt, exactly as
   today. Retrying a timeout would hold the chat open — the reason the scripter
   refused to do it.
+
+  > **Cross-reference (2026-10-10).** The narrator's synthesis carries a
+  > single, separate carve-out: a *transient server error*
+  > (`500`/`502`/`503`/`504`) on the one single-shot **delivery** may be
+  > re-attempted once, opt-in and delivery-only —
+  > `SPECS/2026-10-09-narrator-transient-retry/`. The step rule above is
+  > unchanged: a 5xx on a step still fails once, exactly as today.
 - **R1.4** The backoff sleep is a module-level seam (`gemini._sleep`, default
   `asyncio.sleep`) so tests never wait. It is the only monkeypatched symbol in
   the phase.

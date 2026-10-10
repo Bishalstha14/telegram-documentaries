@@ -203,8 +203,12 @@ per-class timeouts (text 20 s, synthesis 60 s). A spent throttle is answered
 with a "try again" line, the one reply that never says `/restart`, because the
 session is held for a resend. A silent-failure guard walks `src/` and refuses
 any `except:` that swallows — bare `except:`, or a body of only `pass`/`...` —
-and is self-tested so it cannot rot. See
-`SPECS/2026-10-09-resilience/`. Suite: 608 tests, ruff, mypy strict.
+and is self-tested so it cannot rot. A follow-up delivery carve-out
+(2026-10-10) added one bounded retry for a *transient server error*
+(`500`/`502`/`503`/`504`) on the narrator's single-shot synthesis — opt-in,
+delivery-only, one re-attempt after 2 s — while a step 5xx still fails once.
+See
+`SPECS/2026-10-09-resilience/`. Suite: 630 tests, ruff, mypy strict.
 
 ---
 
@@ -213,12 +217,12 @@ and is self-tested so it cannot rot. See
 | Phase | Name | Status |
 |-------|------|--------|
 | 1 | Repository & gateway | **Complete** (verified live) |
-| 2 | Bouncer | **Complete** (text slice; part of the 608-test suite) |
-| 3 | Interviewer | **Complete** (text slice; part of the 608-test suite) |
+| 2 | Bouncer | **Complete** (text slice; part of the 630-test suite) |
+| 3 | Interviewer | **Complete** (text slice; part of the 630-test suite) |
 | 4 | Converter | **Blocked** — image-generation quota on the API key (`429 generate_content_free_tier_requests` on every image model); resumes when billing is enabled |
 | 5 | Scripter | **Complete** — delivered as a voice note (`lameenc`, voice `Kore`); Converter leg still blocked |
 | 6 | Narrator | **Complete** — verified live: `narration_delivered` + `voice_note_sent`, timeout fix `fb2b675` |
-| 7 | Resilience | **Complete** — per-class timeouts, bounded 429 retry, wrong-payload matrix, no-silent-except guard; 608 tests green |
+| 7 | Resilience | **Complete** — per-class timeouts, bounded 429 retry, narrator delivery retry for transient 5xx, wrong-payload matrix, no-silent-except guard; 630 tests green |
 
 **Live verification: done.** The end-to-end flow — portrait photo → Bouncer →
 5–7 questions → narration → **voice note** — ran against the live bot

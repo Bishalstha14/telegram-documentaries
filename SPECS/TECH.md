@@ -127,7 +127,7 @@ requirement (text-slice R1.2 and R9.3).
 ## Timeouts and throttling
 
 Timeouts are **per call class**, not one global ceiling, and a 429 is the only
-failure the transport re-attempts.
+failure the transport re-attempts on the default (step) path.
 
 - **Text calls (Bouncer, Interviewer, Scripter): 20 s** — `GEMINI_TIMEOUT_MS`.
 - **Synthesis calls (Narrator): 60 s** — `TTS_TIMEOUT_MS`, its own
@@ -137,14 +137,28 @@ failure the transport re-attempts.
 - **Throttle retry:** a `429` is retried at most three times total
   (`_THROTTLE_MAX_ATTEMPTS = 3`), paced `1.0 s` then `2.0 s` through a
   module-level `_sleep` seam so tests never wait. Throttles are cheap to retry
-  — they fail in well under a second — and only the `429` is retried; timeouts,
+  — they fail in well under a second — and, on the default path, only the
+  `429` is retried; timeouts,
   transport failures, `5xx` and unreadable replies raise on the first attempt.
   When the bound is spent, `GeminiThrottledError` (`GeminiUnavailableError`'s
   strict subclass) surfaces and the hub answers with `RATE_LIMITED` — a
   "give me a moment and send that again" line that never mentions `/restart`,
   because the session is held and the resend is consumed as the answer already
-  on screen. Timeouts and `5xx` are *not* retried, for the same reason the
+  on screen. Timeouts and step `5xx` are *not* retried (the narrator delivery
+  carve-out below is the one opt-in exception), for the same reason the
   re-attempt is bounded: a retry on a slow call holds the chat open for nothing.
+- **Transient server-error retry (narrator delivery only):** a synthesis call
+  that fails with a *transient server error* — `500`/`502`/`503`/`504`
+  (`_TRANSIENT_SERVER_CODES`) — is re-attempted **once** after a flat `2.0 s`
+  wait (`_TRANSIENT_MAX_ATTEMPTS = 2`, `_TRANSIENT_BASE_DELAY_SECONDS = 2.0`),
+  through the same `_sleep` seam. It is **opt-in** (`_call_transport`'s
+  `retry_transient_server_errors`, default `False`); only the narrator's
+  `_synthesize` passes `True`, so no step inherits it. The two retry rules
+  keep **independent budgets** (throttle's `attempts` vs. the transient
+  rule's `transient_attempts`), so a `429` that spent the throttle budget
+  does not consume the delivery's single transient attempt. When the retry is
+  spent the existing D6 fallback still delivers the narration as text. See
+  `SPECS/2026-10-09-narrator-transient-retry/`.
 
 ## Logging & error policy
 

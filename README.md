@@ -124,8 +124,11 @@ table is testable without Telegram, Gemini or a filesystem.
 Collapsing these into one exception would force a choice between losing a
 half-finished interview on a rate limit, and hiding a broken reply behind a
 friendly "try again". Throttles are retried briefly (three attempts, 1 s then
-2 s); nothing else is, because a retry on a slow call holds the chat open for
-nothing.
+2 s). The one other retry is the narrator's *delivery*: a transient server
+error (`500`/`502`/`503`/`504`) on the single-shot speech call is
+re-attempted once after 2 s before the narration falls back to text — steps,
+timeouts and transport failures still fail on the first attempt, because a
+retry on a slow call holds the chat open for nothing.
 
 ### Rejected, never repaired
 
@@ -194,7 +197,7 @@ src/telegram_documentaries/
   config.py       Settings from .env, both secrets as SecretStr
   observability.py  configure_logging, get_logger, @logged
 
-tests/unit/       608 tests, no network, no real credentials
+tests/unit/       630 tests, no network, no real credentials
 SPECS/            the constitution, and one folder per feature
 ```
 
@@ -228,7 +231,7 @@ Never implement directly on `main`.
 | Phase | What it delivers | State |
 |---|---|---|
 | 1 | Repository and `/start` gateway | **Done** — verified against the live bot |
-| 2–5 | Photo → Bouncer → Interviewer → Scripter → Narrator | **Done** — 608 tests green; voice note delivered live (`narration_delivered` + `voice_note_sent`) |
+| 2–5 | Photo → Bouncer → Interviewer → Scripter → Narrator | **Done** — 630 tests green; voice note delivered live (`narration_delivered` + `voice_note_sent`) |
 | 3 (img) | Converter: the hybrid animal portrait | **Blocked** — image-generation quota on the project's API key (`429` on every image model); resumes when billing is enabled |
 | 7 | Hardening and polish | **Done** — per-class timeouts, bounded 429 retry, wrong-payload matrix, no-silent-except guard |
 

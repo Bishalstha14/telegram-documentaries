@@ -120,9 +120,24 @@ _JSON_MIME_TYPE = "application/json"
 #: just as a 5xx does, rather than being treated as our own defect.
 _THROTTLED_CODE = 429
 
+#: R1.1/D2: the transient server-error set. These are the classic retryable
+#: upstream hiccups - a gateway or product server that is briefly overloaded -
+#: and they are the *only* 5xx worth one bounded re-attempt on a single-shot
+#: delivery. `501` and `505` are server-side but not transient, and a timeout or
+#: transport failure is exactly the "slow call" R1.5 refuses to hold the chat
+#: open for.
+_TRANSIENT_SERVER_CODES = frozenset({500, 502, 503, 504})
+
 #: R1.2: bounded retry for a 429. The delay doubles: 1.0 s then 2.0 s.
 _THROTTLE_MAX_ATTEMPTS = 3
 _THROTTLE_BASE_DELAY_SECONDS = 1.0
+
+#: R1.4: the opt-in transient-server-error retry. At most two attempts in
+#: total, so exactly one wait, of 2.0 s. The exponential notation is kept for
+#: consistency with the throttle idiom, but with a bound of two there is only
+#: the first term (D5).
+_TRANSIENT_MAX_ATTEMPTS = 2
+_TRANSIENT_BASE_DELAY_SECONDS = 2.0
 
 #: R1.4: sleep seam so tests never wait.
 _sleep = asyncio.sleep
@@ -319,6 +334,13 @@ class GeminiUnavailableError(GeminiError):
     The message is assembled from the stage, a fixed reason, the exception's
     *class name* and its status code. It never contains ``str(exc)``, which for
     `google.genai` would carry the raw response body (R1.7).
+
+    ``transient`` is the one boolean the transport loop consults to decide
+    whether this failure earns the single bounded re-attempt of this feature. It
+    is classified *once*, at :func:`_from_api_error` / :func:`_unavailable`, so
+    no call site re-derives a status code (D3). It defaults to ``False`` - the
+    conservative choice - so every existing builder, including
+    :class:`GeminiThrottledError`, is unchanged.
     """
 
     def __init__(
@@ -328,6 +350,7 @@ class GeminiUnavailableError(GeminiError):
         reason: str,
         error_type: str,
         error_code: int | None,
+        transient: bool = False,
     ) -> None:
         super().__init__(
             f"{stage.value}: Gemini unavailable ({reason}); "
@@ -337,6 +360,7 @@ class GeminiUnavailableError(GeminiError):
         self.reason = reason
         self.error_type = error_type
         self.error_code = error_code
+        self.transient = transient
 
 
 class GeminiThrottledError(GeminiUnavailableError):
@@ -482,6 +506,7 @@ async def _call_transport(
     stage: Stage,
     chat_id: int,
     update_id: int,
+    retry_transient_server_errors: bool = False,
 ) -> types.GenerateContentResponse:
     """Make the HTTP call, mapping every failure onto the taxonomy (R1.6).
 
@@ -490,16 +515,28 @@ async def _call_transport(
     classification is written once. Nothing here renders ``str(exc)``; the
     leaky originals are chained with ``from None``.
 
-    The loop is the Phase 7 rate-limit fallback (R1.2): a ``429`` is the one
+    The loop is the Phase 7 rate-limit fallback (R1.2): a ``429`` is one
     failure worth re-attempting, because it is transient *and* cheap - it fails
     in well under a second (measured: 0.1-0.6 s on every image-model probe in
     the feasibility pass), so the bounded backoff costs at most ~3 s and the
-    user often never learns a throttle happened. Everything else - timeouts,
-    transport failures, 5xx, unreadable replies - raises on the first attempt,
-    for the reason the scripter recorded: a retry on a slow call holds the chat
-    open for nothing (R1.3).
+    user often never learns a throttle happened. For the steps and the default
+    path, everything else - timeouts, transport failures, 5xx, unreadable
+    replies - raises on the first attempt, for the reason the scripter
+    recorded: a retry on a slow call holds the chat open for nothing (R1.3).
+
+    ``retry_transient_server_errors`` (R1.1/R1.3/D4) adds a *second*, opt-in
+    rule for the one single-shot delivery in the feature: when set, a
+    ``GeminiUnavailableError`` classified as ``transient`` (a ``500``/``502``/
+    ``503``/``504``) is re-attempted once, after a 2 s wait, before it is
+    reported. It defaults to ``False`` so the generate path (the steps) can
+    never inherit it - a failed step is re-triggerable by the user's next
+    message and must keep failing on the first attempt. The two rules share the
+    loop but are otherwise independent, each with its own attempt budget: the
+    throttle branch is checked first, so a ``429`` still takes the throttle
+    path without consuming the transient rule's single attempt.
     """
     attempts = 0
+    transient_attempts = 0
     while True:
         try:
             return await transport.generate_content(
@@ -535,7 +572,43 @@ async def _call_transport(
                 )
                 await _sleep(delay)
                 continue
-            raise _from_api_error(stage, exc, chat_id, update_id) from None
+            # Classify once (D3): the marker is read off the typed error, never
+            # re-derived from the status code here. The throttle branch above
+            # already handled a `429`, so a `GeminiThrottledError` reaches this
+            # point only on its final attempt, where `transient` is `False` and
+            # the bound is irrelevant.
+            classified = _from_api_error(stage, exc, chat_id, update_id)
+            if (
+                retry_transient_server_errors
+                and isinstance(classified, GeminiUnavailableError)
+                and classified.transient
+                and transient_attempts < _TRANSIENT_MAX_ATTEMPTS - 1
+            ):
+                # The single bounded re-attempt for the single-shot delivery
+                # (R1.1/R1.4). The first attempt's `gemini_call_failed` (ERROR)
+                # was emitted by `_from_api_error` above and is preserved; this
+                # record is the WARNING that says a retry is about to happen
+                # (R1.9). The delay is the named constant, never a re-derived
+                # number. `transient_attempts` is a *separate* budget from the
+                # throttle's `attempts` (R1.6): a `429` that took its throttle
+                # turn must not consume the transient rule's single attempt.
+                transient_attempts += 1
+                delay = _TRANSIENT_BASE_DELAY_SECONDS * (2 ** (transient_attempts - 1))
+                logger.warning(
+                    "gemini_transient_retry",
+                    extra={
+                        "event": "gemini_transient_retry",
+                        "stage": stage.value,
+                        "attempt": transient_attempts,
+                        "delay": delay,
+                        "error_code": classified.error_code,
+                        "chat_id": chat_id,
+                        "update_id": update_id,
+                    },
+                )
+                await _sleep(delay)
+                continue
+            raise classified from None
         except genai_errors.UnknownApiResponseError as exc:
             # The SDK received something it could not read: a reply we cannot
             # use, not an outage. `str(exc)` is not rendered.
@@ -648,6 +721,11 @@ async def _synthesize(
     `str()` is unsafe escape to the decorator's `exc_info` rendering. It reuses
     :func:`_call_transport`, so it inherits the same error classification as
     :func:`_generate_content` rather than re-deriving it.
+
+    Synthesis is the one **single-shot delivery** in the feature: unlike a step,
+    a failed voice note cannot be re-triggered by the user's next message, so it
+    opts in to the bounded transient-server-error retry (R1.1/D4). The generate
+    path leaves the flag at its default and never retries a 5xx.
     """
     stage = Stage.NARRATOR
     request = SynthesisRequest(text=text, voice=voice)
@@ -659,6 +737,7 @@ async def _synthesize(
         stage=stage,
         chat_id=chat_id,
         update_id=update_id,
+        retry_transient_server_errors=True,
     )
     return _synthesized_audio(stage, raw, chat_id, update_id)
 
@@ -1150,6 +1229,7 @@ def _from_api_error(
             chat_id,
             update_id,
             code=code,
+            transient=code in _TRANSIENT_SERVER_CODES,
         )
     return _reject(
         stage,
@@ -1178,8 +1258,15 @@ def _unavailable(
     update_id: int | None,
     *,
     code: int | None = None,
+    transient: bool = False,
 ) -> GeminiUnavailableError:
-    """Build and log an environmental failure, reading only `type(exc)`."""
+    """Build and log an environmental failure, reading only `type(exc)`.
+
+    ``transient`` is threaded straight onto the typed error and into the record
+    (R1.2/R1.9): the marker is classified here and nowhere else, and the additive
+    ``transient`` log field lets an operator see at a glance, in the one
+    ``gemini_call_failed`` line, whether the failure was retry-eligible.
+    """
     error_type = type(exc).__name__
     error_code = code if code is not None else _code_of(exc)
     logger.error(
@@ -1192,6 +1279,7 @@ def _unavailable(
             "update_id": update_id,
             "error_type": error_type,
             "error_code": error_code,
+            "transient": transient,
         },
     )
     return GeminiUnavailableError(
@@ -1199,6 +1287,7 @@ def _unavailable(
         reason=reason,
         error_type=error_type,
         error_code=error_code,
+        transient=transient,
     )
 
 

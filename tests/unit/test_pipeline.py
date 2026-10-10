@@ -34,8 +34,10 @@ from conftest import (
     FakeTelegramBot,
     LogRecorder,
 )
+from google.genai import errors, types
 from telegram import Bot, Update
 
+from telegram_documentaries import gemini
 from telegram_documentaries.bouncer import BouncerVerdict, Verdict
 from telegram_documentaries.contracts import InboundUpdate, MediaKind, Reply, VoiceNote
 from telegram_documentaries.gemini import (
@@ -203,6 +205,12 @@ class _SynthesizingGeminiClient(FakeGeminiClient):
     `synthesize` deliberately does not append to `calls`/`call_count`: those
     count generation calls, and the existing assertions depend on that. It is
     recorded separately on `synth_calls`.
+
+    When `synth_transport` is set, `synthesize` is routed through the **real**
+    ``gemini._synthesize`` over that transport, so the transient-server-error
+    retry actually runs at the seam (the delivery-level proof of R1.7/R1.8). A
+    fake that merely "raised once then returned" would pass with or without the
+    retry and prove nothing; the fake transport is the only thing substituted.
     """
 
     def __init__(
@@ -212,10 +220,12 @@ class _SynthesizingGeminiClient(FakeGeminiClient):
         error: BaseException | None = None,
         synth_audio: SynthesizedAudio | None = None,
         synth_error: BaseException | None = None,
+        synth_transport: Any | None = None,
     ) -> None:
         super().__init__(replies, error=error)
         self.synth_audio = synth_audio if synth_audio is not None else PCM_AUDIO
         self.synth_error = synth_error
+        self.synth_transport = synth_transport
         self.synth_calls: list[dict[str, Any]] = []
 
     async def synthesize(
@@ -224,6 +234,10 @@ class _SynthesizingGeminiClient(FakeGeminiClient):
         self.synth_calls.append(
             {"text": text, "voice": voice, "chat_id": chat_id, "update_id": update_id}
         )
+        if self.synth_transport is not None:
+            return await gemini._synthesize(
+                self.synth_transport, text, voice, chat_id, update_id
+            )
         if self.synth_error is not None:
             raise self.synth_error
         return self.synth_audio
@@ -278,10 +292,15 @@ def _harness(
     error: BaseException | None = None,
     synth_audio: SynthesizedAudio | None = None,
     synth_error: BaseException | None = None,
+    synth_transport: Any | None = None,
     fetcher: FakePhotoFetcher | None = None,
 ) -> Harness:
     client = _SynthesizingGeminiClient(
-        replies, error=error, synth_audio=synth_audio, synth_error=synth_error
+        replies,
+        error=error,
+        synth_audio=synth_audio,
+        synth_error=synth_error,
+        synth_transport=synth_transport,
     )
     store = SessionStore()
     media = MediaStore(base_dir=tmp_path / "media")
@@ -1633,3 +1652,148 @@ async def test_the_session_is_completed_and_saved_before_synthesis_is_attempted(
     # The synthesis *was* attempted, after the save: the fallback is a real
     # degradation, not the row never trying.
     assert len(h.client.synth_calls) == 1
+
+
+# --------------------------------------------------------------------------
+# R1.7/R1.8 - the transient retry, proved through the delivery, end to end.
+# --------------------------------------------------------------------------
+#
+# These drive the whole hub with the shared fake for generation, but route the
+# *synthesis* through the real `gemini._synthesize` over a scripted transport.
+# That is deliberate, and it is the one place these tests differ from the rest
+# of the section: a fake whose `synthesize` simply "raised once then returned"
+# would pass with or without the retry, proving nothing. Running the real seam
+# means the transient retry actually executes and the pipeline sees exactly
+# what production would hand it - the delivery-level outcome R1.7/R1.8 describe.
+# The `generate` half stays the shared fake, so the interview still flows to the
+# narration without scripting the three stage replies.
+
+
+@pytest.fixture(autouse=True)
+def no_wait(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture the transport backoff so no delivery test ever sleeps for real.
+
+    The retry tests below reach ``gemini._sleep`` through the *real*
+    ``_synthesize`` seam, and ``_sleep`` defaults to ``asyncio.sleep`` - so the
+    2 s wait would be spent for real. Mirroring the ``no_wait`` idiom in
+    ``test_gemini.py``: patch the seam with an async recorder and assert on the
+    captured delays against the named constant instead of the wall clock. It is
+    autouse, so no test in this module can sleep by forgetting to ask for it.
+    """
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(gemini, "_sleep", fake_sleep)
+    return delays
+
+
+class _ScriptedSynthesisTransport:
+    """The TTS transport seam, replaying a script of outcomes per call.
+
+    An exception item is raised; anything else is returned as the SDK response.
+    `attempts` counts every HTTP attempt, so a test can assert the retry really
+    re-called the transport rather than trusting the outcome alone.
+    """
+
+    def __init__(self, script: list[Any]) -> None:
+        self._script = list(script)
+        self.attempts = 0
+
+    async def generate_content(
+        self,
+        *,
+        model: str,
+        contents: types.Content,
+        config: types.GenerateContentConfig,
+    ) -> types.GenerateContentResponse:
+        self.attempts += 1
+        item = self._script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _synthesis_server_error(code: int) -> errors.APIError:
+    """An `APIError` for `code`, as the SDK would raise it for a bad status."""
+    return errors.ServerError(code, {"error": {"message": "upstream unavailable"}})
+
+
+def _audio_response() -> types.GenerateContentResponse:
+    """A canned TTS reply: one candidate, one inline-data audio part."""
+    return types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            inline_data=types.Blob(
+                                data=b"\x00\x00" * PCM_SAMPLES,
+                                mime_type="audio/l16; rate=24000; channels=1",
+                            )
+                        )
+                    ],
+                ),
+                finish_reason=types.FinishReason.STOP,
+            )
+        ]
+    )
+
+
+async def test_a_transient_synthesis_failure_retried_to_success_delivers_a_voice_note(
+    tmp_path: Path, app_records: LogRecorder, no_wait: list[float]
+) -> None:
+    """R1.8: the retry is invisible - the user gets the voice note."""
+    transport = _ScriptedSynthesisTransport([_synthesis_server_error(504), _audio_response()])
+    h = _harness(tmp_path, _happy_replies(), synth_transport=transport)
+
+    reply = await _finish_interview(h)
+
+    assert isinstance(reply, VoiceNote)
+    assert h.voice_notes == [reply]
+    assert transport.attempts == 2, "the retry must actually re-attempt synthesis"
+    # The requested wait is the named constant, captured not slept (R1.4).
+    assert no_wait == [gemini._TRANSIENT_BASE_DELAY_SECONDS]
+    assert h.phase() is Phase.SCRIPTED
+    assert len(_events(app_records, "narration_delivered")) == 1
+    assert _events(app_records, "narration_voice_failed") == []
+
+
+async def test_a_transient_synthesis_failure_retried_in_vain_falls_back_to_the_text(
+    tmp_path: Path, app_records: LogRecorder, no_wait: list[float]
+) -> None:
+    """R1.7: a spent retry degrades to text, with exactly one failure record."""
+    transport = _ScriptedSynthesisTransport(
+        [_synthesis_server_error(504), _synthesis_server_error(504)]
+    )
+    h = _harness(tmp_path, _happy_replies(), synth_transport=transport)
+
+    reply = await _finish_interview(h)
+
+    assert reply == SCRIPT.text
+    assert reply != GENERIC_FAILURE
+    assert transport.attempts == 2
+    assert no_wait == [gemini._TRANSIENT_BASE_DELAY_SECONDS]
+    assert h.phase() is Phase.SCRIPTED
+    failed = _events(app_records, "narration_voice_failed")
+    assert len(failed) == 1
+    assert app_records.extra_of(failed[0])["reason"] == "synthesis"
+    assert _events(app_records, "narration_delivered") == []
+
+
+async def test_a_non_transient_synthesis_failure_is_not_retried_and_falls_back(
+    tmp_path: Path, app_records: LogRecorder, no_wait: list[float]
+) -> None:
+    """R1.5/D2: a 501 is outside the transient set, so synthesis is attempted once."""
+    transport = _ScriptedSynthesisTransport([_synthesis_server_error(501)])
+    h = _harness(tmp_path, _happy_replies(), synth_transport=transport)
+
+    reply = await _finish_interview(h)
+
+    assert reply == SCRIPT.text
+    assert transport.attempts == 1
+    assert no_wait == []
+    assert len(_events(app_records, "narration_voice_failed")) == 1
+    assert _events(app_records, "narration_delivered") == []

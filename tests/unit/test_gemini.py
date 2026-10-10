@@ -1147,6 +1147,264 @@ async def test_synthesize_retries_a_throttle_too(no_wait: list[float]) -> None:
 
 
 # ==========================================================================
+# R1.2/D2 - a transient server error is marked on the typed error, once.
+# ==========================================================================
+#
+# The marker is classified at the one builder every caller passes through
+# (`_from_api_error` -> `_unavailable`), so no call site re-derives a status
+# code. The transport loop then tests `error.transient` rather than re-reading
+# `error_code` (D3). The set is exactly the classic retryable gateway set; a
+# timeout, a transport failure and a 429 are all deliberately outside it.
+
+_TRANSIENT_SERVER_STATUSES = (500, 502, 503, 504)
+
+
+def _gemini_call_failed_extras(app_records: LogRecords) -> list[dict[str, Any]]:
+    """The `extra` of every `gemini_call_failed` record, in emission order."""
+    return [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_call_failed"
+    ]
+
+
+@pytest.mark.parametrize("code", _TRANSIENT_SERVER_STATUSES)
+async def test_a_transient_server_error_is_marked_transient(
+    code: int,
+    app_records: LogRecords,
+) -> None:
+    """R1.2/D2: exactly `{500, 502, 503, 504}` carries the marker."""
+    transport = FakeTransport(error=errors.ServerError(code, {"error": {"message": "boom"}}))
+
+    with pytest.raises(GeminiUnavailableError) as excinfo:
+        await _generate(_client(transport))
+
+    assert excinfo.value.transient is True
+    assert excinfo.value.error_code == code
+    # The additive log field carries the same marker as the typed error (R1.9).
+    assert [
+        record["transient"] for record in _gemini_call_failed_extras(app_records)
+    ] == [True]
+
+
+@pytest.mark.parametrize("code", [501, 505, 599])
+async def test_a_server_error_outside_the_transient_set_is_not_marked_transient(
+    code: int,
+    app_records: LogRecords,
+) -> None:
+    """D2: `501`/`505`/`599` are server-side but not retryable."""
+    transport = FakeTransport(error=errors.APIError(code, {"error": {"message": "boom"}}))
+
+    with pytest.raises(GeminiUnavailableError) as excinfo:
+        await _generate(_client(transport))
+
+    assert excinfo.value.transient is False
+    assert excinfo.value.error_code == code
+    assert [
+        record["transient"] for record in _gemini_call_failed_extras(app_records)
+    ] == [False]
+
+
+async def test_a_timeout_is_not_marked_transient(app_records: LogRecords) -> None:
+    """R1.5: a slow call is exactly the call that must not be retried."""
+    transport = FakeTransport(error=httpx.ReadTimeout("too slow"))
+
+    with pytest.raises(GeminiUnavailableError) as excinfo:
+        await _generate(_client(transport))
+
+    assert excinfo.value.transient is False
+    assert [
+        record["transient"] for record in _gemini_call_failed_extras(app_records)
+    ] == [False]
+
+
+async def test_a_throttle_is_not_marked_transient() -> None:
+    """R1.6: a 429 keeps its own type and its subtype relationship."""
+    transport = FakeTransport(error=errors.ClientError(429, {"error": {"message": "quota"}}))
+
+    with pytest.raises(gemini.GeminiThrottledError) as excinfo:
+        await _generate(_client(transport))
+
+    assert excinfo.value.transient is False
+    assert isinstance(excinfo.value, GeminiUnavailableError)
+
+
+# ==========================================================================
+# R1.1/R1.4 - one bounded retry for a transient server error on synthesis.
+# ==========================================================================
+#
+# The retry is opt-in at the transport: `_call_transport` gains
+# `retry_transient_server_errors` (default `False`), and only the narrator's
+# `_synthesize` passes `True`. The generate path (the steps) therefore cannot
+# inherit it, which is what keeps every step test byte-for-byte unchanged
+# (R1.3/D4). The delay is asserted against the named constant, never a
+# re-derived number (R1.4).
+
+
+def test_the_transient_retry_policy_is_named_constants() -> None:
+    """R1.4: two attempts, one 2 s wait, and the exact `{500, 502, 503, 504}` set."""
+    assert gemini._TRANSIENT_MAX_ATTEMPTS == 2
+    assert gemini._TRANSIENT_BASE_DELAY_SECONDS == 2.0
+    assert frozenset({500, 502, 503, 504}) == gemini._TRANSIENT_SERVER_CODES
+
+
+async def test_synthesis_retries_a_transient_server_error_then_succeeds(
+    no_wait: list[float],
+    app_records: LogRecords,
+) -> None:
+    """R1.1/R1.8: one 504, then success - the retry is invisible to the caller."""
+    transport = FakeTransport(
+        script=[
+            errors.ServerError(504, {"error": {"message": "gateway timeout"}}),
+            _audio_reply(),
+        ]
+    )
+
+    audio = await _synthesize(_client(transport))
+
+    assert audio.sample_rate == 24_000
+    assert len(transport.calls) == 2, "the retry must actually re-call the transport"
+    assert no_wait == [gemini._TRANSIENT_BASE_DELAY_SECONDS]
+
+    retries = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_transient_retry"
+    ]
+    assert len(retries) == 1
+    retry = retries[0]
+    assert retry["stage"] == "narrator"
+    assert retry["attempt"] == 1
+    assert retry["delay"] == gemini._TRANSIENT_BASE_DELAY_SECONDS
+    assert retry["error_code"] == 504
+
+    # The loud failure is preserved: the first attempt still emitted its
+    # `gemini_call_failed` (ERROR) before the retry (R1.9).
+    failed = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_call_failed"
+    ]
+    assert len(failed) == 1, "the failed first attempt must still be logged"
+
+
+async def test_synthesis_reports_the_transient_error_after_the_retry_is_spent(
+    no_wait: list[float],
+    app_records: LogRecords,
+) -> None:
+    """R1.1/R1.7: a 504 on both attempts raises after exactly two calls."""
+    transport = FakeTransport(
+        script=[
+            errors.ServerError(504, {"error": {"message": "gateway timeout"}}),
+            errors.ServerError(504, {"error": {"message": "gateway timeout"}}),
+        ]
+    )
+
+    with pytest.raises(GeminiUnavailableError):
+        await _synthesize(_client(transport))
+
+    assert len(transport.calls) == gemini._TRANSIENT_MAX_ATTEMPTS
+    retries = [
+        app_records.extra_of(record)
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_transient_retry"
+    ]
+    assert len(retries) == 1
+
+
+async def test_synthesis_retries_a_transient_error_after_a_throttle_takes_its_turn(
+    no_wait: list[float],
+    app_records: LogRecords,
+) -> None:
+    """R1.6: the two retry rules have *independent* budgets and do not interfere.
+
+    The `429` spends the throttle budget; the `504` must still get its own single
+    transient attempt. A shared attempt counter would let the throttle exhaust
+    the transient rule and deny the single-shot delivery the retry this feature
+    exists to guarantee.
+    """
+    transport = FakeTransport(
+        script=[
+            errors.ClientError(429, {"error": {"message": "quota"}}),
+            errors.ServerError(504, {"error": {"message": "gateway timeout"}}),
+            _audio_reply(),
+        ]
+    )
+
+    audio = await _synthesize(_client(transport))
+
+    assert audio.sample_rate == 24_000
+    assert len(transport.calls) == 3, "the 504 must be retried after the 429 took its turn"
+    assert no_wait == [
+        gemini._THROTTLE_BASE_DELAY_SECONDS,
+        gemini._TRANSIENT_BASE_DELAY_SECONDS,
+    ]
+
+    events = [app_records.extra_of(record).get("event") for record in app_records.records]
+    assert events.count("gemini_transient_retry") == 1
+    assert events.count("gemini_throttled_retry") == 1
+
+
+async def test_synthesis_does_not_retry_a_timeout(
+    no_wait: list[float],
+    app_records: LogRecords,
+) -> None:
+    """R1.5: a timeout is not in the transient set, so the transport is called once."""
+    transport = FakeTransport(error=httpx.ReadTimeout("too slow"))
+
+    with pytest.raises(GeminiUnavailableError):
+        await _synthesize(_client(transport))
+
+    assert len(transport.calls) == 1
+    assert no_wait == []
+    assert not [
+        record
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_transient_retry"
+    ]
+
+
+async def test_synthesis_keeps_using_the_throttle_path_for_a_429(
+    no_wait: list[float],
+    app_records: LogRecords,
+) -> None:
+    """R1.6: the two retry rules are independent and do not interfere."""
+    transport = FakeTransport(error=errors.ClientError(429, {"error": {"message": "quota"}}))
+
+    with pytest.raises(gemini.GeminiThrottledError):
+        await _synthesize(_client(transport))
+
+    assert len(transport.calls) == gemini._THROTTLE_MAX_ATTEMPTS
+    assert no_wait == [1.0, 2.0]
+    assert not [
+        record
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_transient_retry"
+    ]
+
+
+@pytest.mark.parametrize("code", _TRANSIENT_SERVER_STATUSES)
+async def test_generate_does_not_retry_a_transient_server_error(
+    code: int,
+    no_wait: list[float],
+    app_records: LogRecords,
+) -> None:
+    """R1.3/D4: the flag is default-off, so a step still fails on the first attempt."""
+    transport = FakeTransport(error=errors.ServerError(code, {"error": {"message": "boom"}}))
+
+    with pytest.raises(GeminiUnavailableError):
+        await _generate(_client(transport))
+
+    assert len(transport.calls) == 1
+    assert no_wait == []
+    assert not [
+        record
+        for record in app_records.records
+        if app_records.extra_of(record).get("event") == "gemini_transient_retry"
+    ]
+
+
+# ==========================================================================
 # R1.7 - no secret, and no response body, ever reaches a log or a message.
 # ==========================================================================
 
